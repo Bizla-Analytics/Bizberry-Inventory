@@ -7,7 +7,7 @@ import streamlit as st
 
 
 DB_PATH = Path("inventory.db")
-
+st.info(f"Database file location: {DB_PATH.resolve()}")
 
 # -----------------------------
 # Basic app config
