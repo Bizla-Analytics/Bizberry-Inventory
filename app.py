@@ -53,8 +53,6 @@ def check_password() -> bool:
             st.rerun()
         else:
             st.error("Incorrect password")
-
-    st.info("For local setup, create `.streamlit/secrets.toml` and add APP_PASSWORD.")
     return False
 
 
