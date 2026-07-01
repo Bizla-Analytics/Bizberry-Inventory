@@ -81,17 +81,19 @@ def load_branch_users() -> Dict[str, Dict[str, str]]:
     """
     users: Dict[str, Dict[str, str]] = {}
 
-    def add_user(username, password, branch_code, display_name=None):
+    def add_user(username, password, branch_code, display_name=None, branch_name=None):
         username_clean = str(username or "").strip()
         password_clean = str(password or "").strip()
         branch_clean = str(branch_code or "").strip().upper()
         display_clean = str(display_name or username_clean).strip()
+        branch_name_clean = str(branch_name or "").strip()
         if username_clean and password_clean and branch_clean:
             users[username_clean.lower()] = {
                 "username": username_clean,
                 "password": password_clean,
                 "branch_code": branch_clean,
                 "display_name": display_clean or username_clean,
+                "branch_name": branch_name_clean,
             }
 
     for root_key in ["BRANCH_USERS", "branch_users"]:
@@ -104,6 +106,7 @@ def load_branch_users() -> Dict[str, Dict[str, str]]:
                         password=config.get("password") or config.get("PASSWORD"),
                         branch_code=config.get("branch_code") or config.get("BRANCH_CODE"),
                         display_name=config.get("display_name") or config.get("DISPLAY_NAME"),
+                        branch_name=config.get("branch_name") or config.get("BRANCH_NAME"),
                     )
 
     add_user(
@@ -111,6 +114,7 @@ def load_branch_users() -> Dict[str, Dict[str, str]]:
         password=st.secrets.get("MANAGER_PASSWORD"),
         branch_code=st.secrets.get("MANAGER_BRANCH_CODE"),
         display_name=st.secrets.get("MANAGER_DISPLAY_NAME"),
+        branch_name=st.secrets.get("MANAGER_BRANCH_NAME"),
     )
 
     return users
@@ -124,6 +128,7 @@ def show_login_debug(users: Dict[str, Dict[str, str]]) -> None:
                 {
                     "username": u["username"],
                     "branch_code": u["branch_code"],
+                    "branch_name_from_secrets": u.get("branch_name") or "",
                     "display_name": u["display_name"],
                     "password_saved": "Yes" if u.get("password") else "No",
                 }
@@ -239,7 +244,14 @@ def check_login() -> bool:
 
         branch_code = user["branch_code"]
         branch = get_branch_details(branch_code)
-        branch_name = branch["branch_name"] if branch else branch_code
+
+        # Prefer branch_name from Streamlit secrets. If it is not supplied,
+        # use Supabase branches.branch_name. If both are missing, show only BR001.
+        branch_name = (
+            str(user.get("branch_name") or "").strip()
+            or (branch["branch_name"] if branch else "")
+            or branch_code
+        )
 
         st.session_state.authenticated = True
         st.session_state.username = user["username"]
@@ -1192,11 +1204,19 @@ def section_title(title, caption=None):
         st.caption(caption)
 
 
+def format_branch_label(branch_code: str, branch_name: str | None = None) -> str:
+    branch_code = str(branch_code or "").strip().upper()
+    branch_name = str(branch_name or "").strip()
+    if branch_name and branch_name.upper() != branch_code.upper():
+        return f"{branch_code} - {branch_name}"
+    return branch_code
+
+
 def branch_selector():
     """Managers cannot select branches; branch is fixed by login secrets."""
     branch_code = get_logged_in_branch_code()
     branch_name = st.session_state.get("branch_name", branch_code)
-    st.sidebar.info(f"Branch: {branch_code} - {branch_name}")
+    st.sidebar.info(f"Branch: {format_branch_label(branch_code, branch_name)}")
     return branch_code
 
 
@@ -1867,7 +1887,7 @@ def main():
         st.rerun()
 
     st.title("Branch Inventory Manager")
-    st.caption(f"Logged-in branch: {branch_code} - {st.session_state.get('branch_name', branch_code)}")
+    st.caption(f"Logged-in branch: {format_branch_label(branch_code, st.session_state.get('branch_name', branch_code))}")
 
     if page == "Dashboard":
         page_dashboard(branch_code)
