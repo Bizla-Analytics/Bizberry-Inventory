@@ -1,16 +1,16 @@
 from __future__ import annotations
 
-from datetime import datetime, date, time
-from typing import Dict, List, Tuple, Set
+from datetime import datetime, date, time, timedelta
+from typing import Dict, List, Tuple, Set, Optional
 
 import pandas as pd
 import streamlit as st
 from supabase import Client, create_client
 
 
-# -----------------------------
-# Basic app config
-# -----------------------------
+# ============================================================
+# Streamlit config
+# ============================================================
 st.set_page_config(
     page_title="Branch Inventory Manager",
     page_icon="📦",
@@ -18,20 +18,11 @@ st.set_page_config(
 )
 
 
-# -----------------------------
+# ============================================================
 # Supabase connection
-# -----------------------------
+# ============================================================
 @st.cache_resource
 def get_supabase_client() -> Client:
-    """
-    Required Streamlit secrets:
-
-    SUPABASE_URL = "https://your-project-id.supabase.co"
-    SUPABASE_SERVICE_ROLE_KEY = "your-service-role-key"
-
-    SUPABASE_ANON_KEY is supported as fallback, but if RLS is enabled and no
-    policies are created, the anon key can return empty data even when rows exist.
-    """
     url = str(st.secrets.get("SUPABASE_URL", "")).strip()
     key = str(
         st.secrets.get("SUPABASE_SERVICE_ROLE_KEY", "")
@@ -48,31 +39,51 @@ def get_supabase_client() -> Client:
     return create_client(url, key)
 
 
-def supabase_result_to_df(result) -> pd.DataFrame:
+def result_to_df(result) -> pd.DataFrame:
     if not result or not getattr(result, "data", None):
         return pd.DataFrame()
     return pd.DataFrame(result.data)
 
 
-def safe_table_select(table_name: str, select_cols: str = "*", **filters) -> pd.DataFrame:
-    """Read a Supabase table safely and show the real database error instead of silent empty data."""
-    supabase = get_supabase_client()
+def clear_data_cache() -> None:
     try:
-        query = supabase.table(table_name).select(select_cols)
-        for col, val in filters.items():
-            query = query.eq(col, val)
-        return supabase_result_to_df(query.execute())
-    except Exception as e:
-        st.error(f"Could not read Supabase table/view `{table_name}`. Error: {e}")
-        return pd.DataFrame()
+        st.cache_data.clear()
+    except Exception:
+        pass
 
 
-# -----------------------------
+def is_active_value(value) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ["true", "t", "1", "yes", "y", "active"]
+
+
+def as_float(value, default: float = 0.0) -> float:
+    try:
+        if pd.isna(value):
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def safe_iso_date(value) -> Optional[str]:
+    if value is None or pd.isna(value):
+        return None
+    try:
+        return pd.to_datetime(value).date().isoformat()
+    except Exception:
+        return None
+
+
+# ============================================================
 # Authentication
-# -----------------------------
+# ============================================================
 def load_branch_users() -> Dict[str, Dict[str, str]]:
     """
-    Recommended Streamlit secrets format:
+    Streamlit secrets example:
 
     SUPABASE_URL = "https://your-project-id.supabase.co"
     SUPABASE_SERVICE_ROLE_KEY = "your-service-role-key"
@@ -124,27 +135,18 @@ def load_branch_users() -> Dict[str, Dict[str, str]]:
     return users
 
 
-def is_active_value(value) -> bool:
-    if value is None:
-        return True
-    if isinstance(value, bool):
-        return value
-    return str(value).strip().lower() in ["true", "t", "1", "yes", "y", "active"]
-
-
-def get_branch_details(branch_code: str) -> Dict[str, str] | None:
+def get_branch_details(branch_code: str) -> Optional[Dict[str, str]]:
     supabase = get_supabase_client()
     try:
         result = (
-            supabase
-            .table("branches")
+            supabase.table("branches")
             .select("branch_code, branch_name, active")
             .eq("branch_code", branch_code)
             .limit(1)
             .execute()
         )
     except Exception as e:
-        st.warning(f"Login branch is saved, but branch table could not be read: {e}")
+        st.warning(f"Login branch exists in secrets, but branch table could not be read: {e}")
         return None
 
     if not result.data:
@@ -233,15 +235,15 @@ def get_logged_in_branch_code() -> str:
     return str(branch_code).strip().upper()
 
 
-# -----------------------------
-# Data functions - no current_stock_view required
-# -----------------------------
+# ============================================================
+# Core data readers
+# ============================================================
+@st.cache_data(ttl=30)
 def get_ingredients(include_inactive: bool = False) -> pd.DataFrame:
     supabase = get_supabase_client()
     try:
         result = (
-            supabase
-            .table("ingredients")
+            supabase.table("ingredients")
             .select("ingredient_code, ingredient_name, category, base_unit, min_stock, source_type, active")
             .order("ingredient_name")
             .execute()
@@ -250,124 +252,128 @@ def get_ingredients(include_inactive: bool = False) -> pd.DataFrame:
         st.error(f"Could not read ingredients table. Error: {e}")
         return pd.DataFrame()
 
-    df = supabase_result_to_df(result)
+    df = result_to_df(result)
     if df.empty:
         return df
+
     if not include_inactive and "active" in df.columns:
         df = df[df["active"].apply(is_active_value)].copy()
+
     for col in ["category", "source_type"]:
         if col not in df.columns:
             df[col] = None
+
+    df["ingredient_code"] = df["ingredient_code"].astype(str).str.strip().str.upper()
+    df["ingredient_name"] = df["ingredient_name"].astype(str).str.strip()
+    df["base_unit"] = df["base_unit"].astype(str).str.strip()
+    df["source_type"] = df["source_type"].fillna("Purchased").astype(str).str.strip()
     df["min_stock"] = pd.to_numeric(df.get("min_stock", 0), errors="coerce").fillna(0)
     return df
 
 
-def get_stock_ledger_raw(branch_code: str) -> pd.DataFrame:
+@st.cache_data(ttl=30)
+def get_products(include_inactive: bool = False) -> pd.DataFrame:
     supabase = get_supabase_client()
     try:
         result = (
-            supabase
-            .table("stock_ledger")
-            .select(
-                "transaction_id, transaction_datetime, branch_code, ingredient_code, "
-                "movement_type, qty_in, qty_out, reference_type, reference_id, note"
-            )
-            .eq("branch_code", branch_code)
-            .order("transaction_id", desc=True)
+            supabase.table("products")
+            .select("product_code, item_name, category_name, active")
+            .order("item_name")
             .execute()
         )
-        df = supabase_result_to_df(result)
+        df = result_to_df(result)
     except Exception as e:
-        st.error(f"Could not read stock_ledger table. Error: {e}")
+        st.error(f"Could not read products table. Error: {e}")
         return pd.DataFrame()
 
-    for col in ["qty_in", "qty_out"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+    if df.empty:
+        return df
+
+    if not include_inactive and "active" in df.columns:
+        df = df[df["active"].apply(is_active_value)].copy()
+
+    df["product_code"] = df["product_code"].astype(str).str.strip().str.upper()
+    df["item_name"] = df["item_name"].astype(str).str.strip()
+    df["item_name_clean"] = df["item_name"].str.lower()
     return df
 
 
-def get_current_stock(branch_code: str) -> pd.DataFrame:
-    """Calculate current stock from stock_ledger + ingredients. No Supabase view is required."""
-    ingredients = get_ingredients()
-    expected_cols = [
-        "branch_code", "ingredient_code", "ingredient_name", "category", "base_unit",
-        "min_stock", "current_qty", "status",
-    ]
-    if ingredients.empty:
-        return pd.DataFrame(columns=expected_cols)
-
-    ledger = get_stock_ledger_raw(branch_code)
-    if ledger.empty:
-        stock_sum = pd.DataFrame(columns=["ingredient_code", "qty_in", "qty_out"])
-    else:
-        stock_sum = (
-            ledger.groupby("ingredient_code", as_index=False)[["qty_in", "qty_out"]]
-            .sum()
-        )
-
-    df = ingredients.merge(stock_sum, on="ingredient_code", how="left")
-    df["qty_in"] = pd.to_numeric(df.get("qty_in", 0), errors="coerce").fillna(0)
-    df["qty_out"] = pd.to_numeric(df.get("qty_out", 0), errors="coerce").fillna(0)
-    df["current_qty"] = df["qty_in"] - df["qty_out"]
-    df["branch_code"] = branch_code
-
-    def status(row):
-        qty = float(row.get("current_qty") or 0)
-        min_stock = float(row.get("min_stock") or 0)
-        if qty <= 0:
-            return "Out of Stock"
-        if qty <= min_stock:
-            return "Low"
-        return "OK"
-
-    df["status"] = df.apply(status, axis=1)
-    for col in expected_cols:
-        if col not in df.columns:
-            df[col] = None
-    return df[expected_cols].sort_values("ingredient_name")
-
-
-def get_stock_qty(branch_code: str, ingredient_code: str) -> float:
-    stock = get_current_stock(branch_code)
-    row = stock[stock["ingredient_code"] == ingredient_code]
-    if row.empty:
-        return 0.0
-    return float(row.iloc[0]["current_qty"] or 0)
-
-
-def add_stock_ledger(
-    branch_code: str,
-    ingredient_code: str,
-    movement_type: str,
-    qty_in: float,
-    qty_out: float,
-    reference_type: str | None = None,
-    reference_id: str | None = None,
-    note: str | None = None,
-    transaction_datetime: datetime | None = None,
-):
+@st.cache_data(ttl=30)
+def get_sub_recipes(include_inactive: bool = False) -> pd.DataFrame:
     supabase = get_supabase_client()
-    dt = transaction_datetime or datetime.now()
-    supabase.table("stock_ledger").insert({
-        "transaction_datetime": dt.isoformat(timespec="seconds"),
-        "branch_code": branch_code,
-        "ingredient_code": ingredient_code,
-        "movement_type": movement_type,
-        "qty_in": float(qty_in or 0),
-        "qty_out": float(qty_out or 0),
-        "reference_type": reference_type,
-        "reference_id": str(reference_id) if reference_id is not None else None,
-        "note": note,
-    }).execute()
+    try:
+        result = (
+            supabase.table("sub_recipes")
+            .select(
+                "sub_recipe_code, sub_recipe_name, output_ingredient_code, expected_output_qty, "
+                "output_unit, prep_type, main_equipment, standard_temperature, "
+                "standard_process_minutes, standard_wastage_qty, standard_wastage_unit, "
+                "shelf_life_days, data_status, active"
+            )
+            .order("sub_recipe_name")
+            .execute()
+        )
+        df = result_to_df(result)
+    except Exception as e:
+        st.error(f"Could not read sub_recipes table. Error: {e}")
+        return pd.DataFrame()
+
+    if df.empty:
+        return df
+
+    if not include_inactive and "active" in df.columns:
+        df = df[df["active"].apply(is_active_value)].copy()
+
+    df["sub_recipe_code"] = df["sub_recipe_code"].astype(str).str.strip().str.upper()
+    df["output_ingredient_code"] = df["output_ingredient_code"].astype(str).str.strip().str.upper()
+    df["expected_output_qty"] = pd.to_numeric(df["expected_output_qty"], errors="coerce").fillna(0)
+    df["prep_type"] = df["prep_type"].fillna("Countable").astype(str).str.strip()
+    return df
 
 
-def get_stock_ledger_report(branch_code: str, limit: int | None = None) -> pd.DataFrame:
+@st.cache_data(ttl=30)
+def get_recipe_ingredients(include_inactive: bool = False) -> pd.DataFrame:
+    supabase = get_supabase_client()
+    try:
+        result = (
+            supabase.table("recipe_ingredients")
+            .select(
+                "recipe_line_id, parent_type, parent_code, sequence, component_type, component_code, "
+                "quantity, unit, waste_percent, process_loss_percent, active, note"
+            )
+            .order("parent_type")
+            .order("parent_code")
+            .order("sequence")
+            .execute()
+        )
+        df = result_to_df(result)
+    except Exception as e:
+        st.error(f"Could not read recipe_ingredients table. Error: {e}")
+        return pd.DataFrame()
+
+    if df.empty:
+        return df
+
+    if not include_inactive and "active" in df.columns:
+        df = df[df["active"].apply(is_active_value)].copy()
+
+    df["parent_type"] = df["parent_type"].astype(str).str.strip()
+    df["parent_type_norm"] = df["parent_type"].str.lower()
+    df["parent_code"] = df["parent_code"].astype(str).str.strip().str.upper()
+    df["component_type"] = df["component_type"].astype(str).str.strip()
+    df["component_type_norm"] = df["component_type"].str.lower()
+    df["component_code"] = df["component_code"].astype(str).str.strip().str.upper()
+    df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce").fillna(0)
+    df["waste_percent"] = pd.to_numeric(df.get("waste_percent", 0), errors="coerce").fillna(0)
+    df["process_loss_percent"] = pd.to_numeric(df.get("process_loss_percent", 0), errors="coerce").fillna(0)
+    return df
+
+
+def get_stock_ledger_raw(branch_code: str, limit: Optional[int] = None) -> pd.DataFrame:
     supabase = get_supabase_client()
     try:
         query = (
-            supabase
-            .table("stock_ledger")
+            supabase.table("stock_ledger")
             .select(
                 "transaction_id, transaction_datetime, branch_code, ingredient_code, "
                 "movement_type, qty_in, qty_out, reference_type, reference_id, note"
@@ -377,114 +383,301 @@ def get_stock_ledger_report(branch_code: str, limit: int | None = None) -> pd.Da
         )
         if limit:
             query = query.limit(limit)
-        ledger = supabase_result_to_df(query.execute())
+        df = result_to_df(query.execute())
     except Exception as e:
         st.error(f"Could not read stock_ledger table. Error: {e}")
         return pd.DataFrame()
 
-    if ledger.empty:
-        return ledger
-
-    ingredients = get_ingredients(include_inactive=True)
-    if not ingredients.empty:
-        ledger = ledger.merge(
-            ingredients[["ingredient_code", "ingredient_name", "base_unit"]],
-            on="ingredient_code",
-            how="left",
-        )
-
-    cols = [
-        "transaction_id", "transaction_datetime", "branch_code", "ingredient_name",
-        "ingredient_code", "base_unit", "movement_type", "qty_in", "qty_out",
-        "reference_type", "reference_id", "note",
-    ]
-    for col in cols:
-        if col not in ledger.columns:
-            ledger[col] = None
-    return ledger[cols]
-
-
-def get_purchase_bills_report(branch_code: str) -> pd.DataFrame:
-    supabase = get_supabase_client()
-    try:
-        result = (
-            supabase
-            .table("purchase_bill_header")
-            .select("*")
-            .eq("branch_code", branch_code)
-            .order("bill_id", desc=True)
-            .execute()
-        )
-        return supabase_result_to_df(result)
-    except Exception as e:
-        st.error(f"Could not read purchase_bill_header table. Error: {e}")
-        return pd.DataFrame()
-
-
-def get_purchase_bill_lines_report(branch_code: str) -> pd.DataFrame:
-    headers = get_purchase_bills_report(branch_code)
-    if headers.empty:
-        return pd.DataFrame()
-
-    bill_ids = headers["bill_id"].tolist()
-    supabase = get_supabase_client()
-    try:
-        lines_result = (
-            supabase
-            .table("purchase_bill_lines")
-            .select("*")
-            .in_("bill_id", bill_ids)
-            .order("line_id")
-            .execute()
-        )
-        lines = supabase_result_to_df(lines_result)
-    except Exception as e:
-        st.error(f"Could not read purchase_bill_lines table. Error: {e}")
-        return pd.DataFrame()
-
-    if lines.empty:
-        return pd.DataFrame()
-
-    ingredients = get_ingredients(include_inactive=True)
-    merged = lines.merge(
-        headers[["bill_id", "branch_code", "bill_date", "supplier_name", "invoice_no"]],
-        on="bill_id",
-        how="left",
-    )
-    if not ingredients.empty:
-        merged = merged.merge(
-            ingredients[["ingredient_code", "ingredient_name", "base_unit"]],
-            on="ingredient_code",
-            how="left",
-        )
-
-    cols = [
-        "bill_id", "branch_code", "bill_date", "supplier_name", "invoice_no",
-        "ingredient_name", "ingredient_code", "qty", "unit", "base_qty",
-        "total_price", "unit_price", "expiry_date",
-    ]
-    for col in cols:
-        if col not in merged.columns:
-            merged[col] = None
-    return merged[cols].sort_values(["bill_id", "ingredient_name"], ascending=[False, True])
-
-
-def get_supplier_price_history_report(branch_code: str) -> pd.DataFrame:
-    df = get_purchase_bill_lines_report(branch_code)
     if df.empty:
         return df
-    cols = [
-        "bill_date", "supplier_name", "invoice_no", "ingredient_name",
-        "base_qty", "unit", "total_price", "unit_price",
+
+    df["ingredient_code"] = df["ingredient_code"].astype(str).str.strip().str.upper()
+    df["transaction_datetime"] = pd.to_datetime(df["transaction_datetime"], errors="coerce")
+    for col in ["qty_in", "qty_out"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+    return df
+
+
+def get_current_stock(branch_code: str) -> pd.DataFrame:
+    ingredients = get_ingredients()
+    expected_cols = [
+        "branch_code", "ingredient_code", "ingredient_name", "category", "base_unit",
+        "source_type", "min_stock", "current_qty", "status",
     ]
-    result = df[cols].copy()
-    result["unit_price"] = pd.to_numeric(result["unit_price"], errors="coerce").round(3)
-    return result.sort_values(["ingredient_name", "bill_date"], ascending=[True, False])
+    if ingredients.empty:
+        return pd.DataFrame(columns=expected_cols)
+
+    ledger = get_stock_ledger_raw(branch_code)
+    if ledger.empty:
+        stock_sum = pd.DataFrame(columns=["ingredient_code", "qty_in", "qty_out"])
+    else:
+        stock_sum = ledger.groupby("ingredient_code", as_index=False)[["qty_in", "qty_out"]].sum()
+
+    df = ingredients.merge(stock_sum, on="ingredient_code", how="left")
+    df["qty_in"] = pd.to_numeric(df.get("qty_in", 0), errors="coerce").fillna(0)
+    df["qty_out"] = pd.to_numeric(df.get("qty_out", 0), errors="coerce").fillna(0)
+    df["current_qty"] = df["qty_in"] - df["qty_out"]
+    df["branch_code"] = branch_code
+
+    def stock_status(row):
+        qty = as_float(row.get("current_qty"))
+        min_stock = as_float(row.get("min_stock"))
+        if qty < 0:
+            return "Negative"
+        if qty == 0:
+            return "Out of Stock"
+        if qty <= min_stock:
+            return "Low"
+        return "OK"
+
+    df["status"] = df.apply(stock_status, axis=1)
+
+    for col in expected_cols:
+        if col not in df.columns:
+            df[col] = None
+    return df[expected_cols].sort_values("ingredient_name")
 
 
-# -----------------------------
-# Sales upload / recipe functions
-# -----------------------------
+def get_stock_as_of(branch_code: str, ingredient_code: str, as_of_dt: datetime) -> float:
+    ledger = get_stock_ledger_raw(branch_code)
+    if ledger.empty:
+        return 0.0
+
+    mask = (
+        (ledger["ingredient_code"] == str(ingredient_code).strip().upper())
+        & (ledger["transaction_datetime"] < pd.Timestamp(as_of_dt))
+    )
+    day = ledger[mask]
+    if day.empty:
+        return 0.0
+    return float(day["qty_in"].sum() - day["qty_out"].sum())
+
+
+def get_day_ledger(branch_code: str, target_date: date) -> pd.DataFrame:
+    ledger = get_stock_ledger_raw(branch_code)
+    if ledger.empty:
+        return ledger
+    return ledger[ledger["transaction_datetime"].dt.date == target_date].copy()
+
+
+def add_stock_ledger(
+    branch_code: str,
+    ingredient_code: str,
+    movement_type: str,
+    qty_in: float,
+    qty_out: float,
+    reference_type: Optional[str] = None,
+    reference_id: Optional[str] = None,
+    note: Optional[str] = None,
+    transaction_datetime: Optional[datetime] = None,
+) -> None:
+    supabase = get_supabase_client()
+    dt = transaction_datetime or datetime.now()
+    supabase.table("stock_ledger").insert({
+        "transaction_datetime": dt.isoformat(timespec="seconds"),
+        "branch_code": branch_code,
+        "ingredient_code": str(ingredient_code).strip().upper(),
+        "movement_type": movement_type,
+        "qty_in": float(qty_in or 0),
+        "qty_out": float(qty_out or 0),
+        "reference_type": reference_type,
+        "reference_id": str(reference_id) if reference_id is not None else None,
+        "note": note,
+    }).execute()
+    clear_data_cache()
+
+
+def insert_ledger_many(payload: List[dict]) -> None:
+    if not payload:
+        return
+    supabase = get_supabase_client()
+    for i in range(0, len(payload), 500):
+        supabase.table("stock_ledger").insert(payload[i:i + 500]).execute()
+    clear_data_cache()
+
+
+# ============================================================
+# Recipe calculation engine
+# ============================================================
+def recipe_rows(recipe_df: pd.DataFrame, parent_type: str, parent_code: str) -> pd.DataFrame:
+    if recipe_df.empty:
+        return pd.DataFrame()
+    return recipe_df[
+        (recipe_df["parent_type_norm"] == parent_type.strip().lower())
+        & (recipe_df["parent_code"] == parent_code.strip().upper())
+    ].copy()
+
+
+def add_waste(qty: float, waste_percent: float, process_loss_percent: float = 0) -> float:
+    return float(qty or 0) * (1 + float(waste_percent or 0) / 100) * (1 + float(process_loss_percent or 0) / 100)
+
+
+def explode_sub_recipe_to_raw_ingredients(
+    recipe_df: pd.DataFrame,
+    sub_df: pd.DataFrame,
+    sub_recipe_code: str,
+    required_output_qty: float,
+    visited: Optional[Set[str]] = None,
+    depth: int = 0,
+    max_depth: int = 20,
+) -> List[Dict[str, object]]:
+    """
+    Backflush a sub recipe into ingredient consumption.
+
+    If SUB001 output is 625 g and product needs 140 g, factor = 140 / 625.
+    Each SUB001 detail line input is multiplied by that factor.
+    Nested sub recipes are also scaled by their expected output.
+    """
+    if visited is None:
+        visited = set()
+
+    sub_code = str(sub_recipe_code).strip().upper()
+    if depth > max_depth:
+        raise ValueError(f"Recipe nesting too deep near {sub_code}.")
+    if sub_code in visited:
+        raise ValueError(f"Circular sub recipe detected near {sub_code}.")
+
+    visited.add(sub_code)
+
+    sub_row = sub_df[sub_df["sub_recipe_code"] == sub_code]
+    if sub_row.empty:
+        raise ValueError(f"Sub recipe `{sub_code}` not found in sub_recipes table.")
+
+    expected_output = as_float(sub_row.iloc[0]["expected_output_qty"])
+    if expected_output <= 0:
+        raise ValueError(f"Sub recipe `{sub_code}` has invalid expected_output_qty.")
+
+    factor = float(required_output_qty or 0) / expected_output
+    rows = recipe_rows(recipe_df, "Sub Recipe", sub_code)
+    if rows.empty:
+        raise ValueError(f"Sub recipe `{sub_code}` has no detail rows in recipe_ingredients.")
+
+    out: List[Dict[str, object]] = []
+    for _, row in rows.iterrows():
+        component_type = str(row["component_type_norm"]).strip().lower()
+        component_code = str(row["component_code"]).strip().upper()
+        base_qty = float(row["quantity"] or 0) * factor
+        qty_with_waste = add_waste(base_qty, row.get("waste_percent", 0), row.get("process_loss_percent", 0))
+
+        if component_type == "ingredient":
+            out.append({
+                "ingredient_code": component_code,
+                "used_qty": qty_with_waste,
+                "calculation_note": f"Backflush {sub_code}",
+            })
+        elif component_type == "sub recipe":
+            nested = explode_sub_recipe_to_raw_ingredients(
+                recipe_df=recipe_df,
+                sub_df=sub_df,
+                sub_recipe_code=component_code,
+                required_output_qty=qty_with_waste,
+                visited=visited.copy(),
+                depth=depth + 1,
+                max_depth=max_depth,
+            )
+            out.extend(nested)
+        else:
+            raise ValueError(f"Invalid component_type `{row['component_type']}` in sub recipe {sub_code}.")
+
+    visited.remove(sub_code)
+    return out
+
+
+def calculate_product_consumption(
+    product_code: str,
+    sold_qty: float,
+    recipe_df: pd.DataFrame,
+    sub_df: pd.DataFrame,
+) -> List[Dict[str, object]]:
+    """
+    Product sales consumption logic:
+    - Product -> Ingredient: deduct ingredient directly.
+    - Product -> Countable Sub Recipe: deduct the output ingredient/prep stock.
+    - Product -> Virtual Sub Recipe: backflush SOP into raw ingredients.
+    """
+    pcode = str(product_code).strip().upper()
+    rows = recipe_rows(recipe_df, "Product", pcode)
+    if rows.empty:
+        return []
+
+    out: List[Dict[str, object]] = []
+    for _, row in rows.iterrows():
+        component_type = str(row["component_type_norm"]).strip().lower()
+        component_code = str(row["component_code"]).strip().upper()
+        base_qty = float(row["quantity"] or 0) * float(sold_qty or 0)
+        qty_with_waste = add_waste(base_qty, row.get("waste_percent", 0), row.get("process_loss_percent", 0))
+
+        if component_type == "ingredient":
+            out.append({
+                "ingredient_code": component_code,
+                "used_qty": qty_with_waste,
+                "calculation_note": "Direct product ingredient",
+            })
+        elif component_type == "sub recipe":
+            sub_row = sub_df[sub_df["sub_recipe_code"] == component_code]
+            if sub_row.empty:
+                raise ValueError(f"Product {pcode} uses missing sub recipe `{component_code}`.")
+
+            prep_type = str(sub_row.iloc[0].get("prep_type") or "Countable").strip().lower()
+            output_ing = str(sub_row.iloc[0]["output_ingredient_code"]).strip().upper()
+
+            if prep_type == "countable":
+                out.append({
+                    "ingredient_code": output_ing,
+                    "used_qty": qty_with_waste,
+                    "calculation_note": f"Countable prep {component_code}",
+                })
+            elif prep_type == "virtual":
+                out.extend(
+                    explode_sub_recipe_to_raw_ingredients(
+                        recipe_df=recipe_df,
+                        sub_df=sub_df,
+                        sub_recipe_code=component_code,
+                        required_output_qty=qty_with_waste,
+                    )
+                )
+            else:
+                raise ValueError(f"Sub recipe {component_code} has invalid prep_type `{prep_type}`.")
+        else:
+            raise ValueError(f"Invalid component_type `{row['component_type']}` for product {pcode}.")
+
+    return out
+
+
+def calculate_sub_recipe_raw_consumption(
+    sub_recipe_code: str,
+    prepared_qty: float,
+    recipe_df: pd.DataFrame,
+    sub_df: pd.DataFrame,
+) -> pd.DataFrame:
+    rows = explode_sub_recipe_to_raw_ingredients(
+        recipe_df=recipe_df,
+        sub_df=sub_df,
+        sub_recipe_code=sub_recipe_code,
+        required_output_qty=prepared_qty,
+    )
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(columns=["ingredient_code", "used_qty"])
+    return df.groupby("ingredient_code", as_index=False).agg(used_qty=("used_qty", "sum"))
+
+
+def enrich_ingredients(df: pd.DataFrame, code_col: str = "ingredient_code") -> pd.DataFrame:
+    ingredients = get_ingredients(include_inactive=True)
+    if df.empty or ingredients.empty or code_col not in df.columns:
+        return df
+    return df.merge(
+        ingredients[["ingredient_code", "ingredient_name", "base_unit", "source_type"]],
+        left_on=code_col,
+        right_on="ingredient_code",
+        how="left",
+        suffixes=("", "_ing"),
+    )
+
+
+# ============================================================
+# Sales upload helpers
+# ============================================================
 REQUIRED_SALES_COLUMNS = [
     "restaurant_name", "invoice_no", "date", "payment_type", "order_type", "status", "area",
     "virtual_brand_name", "brand_grouping", "assign_to", "customer_phone", "customer_name",
@@ -528,152 +721,22 @@ def clean_sales_report(raw: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def get_products() -> pd.DataFrame:
-    supabase = get_supabase_client()
-    try:
-        result = (
-            supabase
-            .table("products")
-            .select("product_code, item_name, category_name, active")
-            .execute()
-        )
-        df = supabase_result_to_df(result)
-    except Exception as e:
-        st.error(
-            "Could not read `products` table. Create this table before using sales upload. "
-            f"Error: {e}"
-        )
-        return pd.DataFrame()
-
-    if df.empty:
-        return df
-    if "active" in df.columns:
-        df = df[df["active"].apply(is_active_value)].copy()
-    df["item_name_clean"] = df["item_name"].astype(str).str.strip().str.lower()
-    return df
-
-
-def get_recipe_ingredients() -> pd.DataFrame:
-    supabase = get_supabase_client()
-    try:
-        result = (
-            supabase
-            .table("recipe_ingredients")
-            .select(
-                "recipe_line_id, parent_type, parent_code, component_type, component_code, "
-                "quantity, unit, waste_percent, active, note"
-            )
-            .execute()
-        )
-        df = supabase_result_to_df(result)
-    except Exception as e:
-        st.error(
-            "Could not read `recipe_ingredients` table. Create this table before using sales upload. "
-            f"Error: {e}"
-        )
-        return pd.DataFrame()
-
-    if df.empty:
-        return df
-    if "active" in df.columns:
-        df = df[df["active"].apply(is_active_value)].copy()
-    df["parent_type"] = df["parent_type"].astype(str).str.strip().str.lower()
-    df["component_type"] = df["component_type"].astype(str).str.strip().str.lower()
-    df["parent_code"] = df["parent_code"].astype(str).str.strip().str.upper()
-    df["component_code"] = df["component_code"].astype(str).str.strip().str.upper()
-    df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce").fillna(0)
-    df["waste_percent"] = pd.to_numeric(df.get("waste_percent", 0), errors="coerce").fillna(0)
-    return df
-
-
-def explode_recipe_for_parent(
-    recipe_df: pd.DataFrame,
-    parent_type: str,
-    parent_code: str,
-    multiplier: float,
-    visited: Set[Tuple[str, str]] | None = None,
-    depth: int = 0,
-    max_depth: int = 20,
-) -> List[Dict[str, object]]:
-    """Recursive recipe explosion: product/sub recipe -> ingredient/sub recipe -> ingredient."""
-    if visited is None:
-        visited = set()
-
-    parent_type_clean = str(parent_type).strip().lower()
-    parent_code_clean = str(parent_code).strip().upper()
-    key = (parent_type_clean, parent_code_clean)
-
-    if depth > max_depth:
-        raise ValueError(f"Recipe nesting too deep near {parent_type} {parent_code}.")
-    if key in visited:
-        raise ValueError(f"Circular recipe detected near {parent_type} {parent_code}.")
-
-    visited.add(key)
-    rows = recipe_df[
-        (recipe_df["parent_type"] == parent_type_clean)
-        & (recipe_df["parent_code"] == parent_code_clean)
-    ]
-
-    output: List[Dict[str, object]] = []
-    for _, row in rows.iterrows():
-        component_type = str(row["component_type"]).strip().lower()
-        component_code = str(row["component_code"]).strip().upper()
-        base_qty = float(row["quantity"] or 0) * float(multiplier or 0)
-        waste_percent = float(row.get("waste_percent") or 0)
-        qty_with_waste = base_qty * (1 + waste_percent / 100)
-
-        if component_type in ["ingredient", "direct ingredient"]:
-            output.append({
-                "ingredient_code": component_code,
-                "used_qty": qty_with_waste,
-                "source_parent_type": parent_type_clean,
-                "source_parent_code": parent_code_clean,
-                "recipe_line_id": row.get("recipe_line_id"),
-            })
-        elif component_type in ["sub recipe", "sub_recipe", "subrecipe", "produced"]:
-            output.extend(
-                explode_recipe_for_parent(
-                    recipe_df=recipe_df,
-                    parent_type="Sub Recipe",
-                    parent_code=component_code,
-                    multiplier=qty_with_waste,
-                    visited=visited.copy(),
-                    depth=depth + 1,
-                    max_depth=max_depth,
-                )
-            )
-        else:
-            raise ValueError(
-                f"Invalid component_type `{row['component_type']}` for parent {parent_type} {parent_code}. "
-                "Use Ingredient or Sub Recipe."
-            )
-
-    visited.remove(key)
-    return output
-
-
-def create_sales_batch_if_table_exists(branch_code: str, sales_date: date, uploaded_filename: str, row_count: int) -> str:
-    """Optional analytical table. If missing, return timestamp ID and continue."""
+def create_sales_batch(branch_code: str, sales_date: date, uploaded_filename: str, row_count: int) -> str:
     batch_id = f"{branch_code}-{sales_date.isoformat()}-{datetime.now().strftime('%Y%m%d%H%M%S')}"
     supabase = get_supabase_client()
-    try:
-        result = supabase.table("sales_upload_batches").insert({
-            "batch_id": batch_id,
-            "branch_code": branch_code,
-            "sales_date": sales_date.isoformat(),
-            "uploaded_filename": uploaded_filename,
-            "row_count": int(row_count),
-            "uploaded_at": datetime.now().isoformat(timespec="seconds"),
-            "uploaded_by": st.session_state.get("username"),
-        }).execute()
-        if result.data and result.data[0].get("batch_id"):
-            return str(result.data[0]["batch_id"])
-    except Exception:
-        pass
+    supabase.table("sales_upload_batches").insert({
+        "batch_id": batch_id,
+        "branch_code": branch_code,
+        "sales_date": sales_date.isoformat(),
+        "uploaded_filename": uploaded_filename,
+        "row_count": int(row_count),
+        "uploaded_at": datetime.now().isoformat(timespec="seconds"),
+        "uploaded_by": st.session_state.get("username"),
+    }).execute()
     return batch_id
 
 
-def insert_optional_sales_lines(batch_id: str, branch_code: str, sales_date: date, sales_df: pd.DataFrame) -> None:
+def insert_sales_lines(batch_id: str, branch_code: str, sales_date: date, sales_df: pd.DataFrame) -> None:
     supabase = get_supabase_client()
     payload = []
     for _, r in sales_df.iterrows():
@@ -692,16 +755,17 @@ def insert_optional_sales_lines(batch_id: str, branch_code: str, sales_date: dat
             "order_type": str(r.get("order_type") or ""),
             "payment_type": str(r.get("payment_type") or ""),
         })
-    if not payload:
-        return
-    try:
-        for i in range(0, len(payload), 500):
-            supabase.table("sales_upload_lines").insert(payload[i:i + 500]).execute()
-    except Exception:
-        pass
+    for i in range(0, len(payload), 500):
+        supabase.table("sales_upload_lines").insert(payload[i:i + 500]).execute()
 
 
-def insert_optional_consumption(batch_id: str, branch_code: str, sales_date: date, consumption_df: pd.DataFrame) -> None:
+def insert_consumption_rows(
+    batch_id: str,
+    branch_code: str,
+    sales_date: date,
+    consumption_df: pd.DataFrame,
+    source: str = "Sales",
+) -> None:
     if consumption_df.empty:
         return
     supabase = get_supabase_client()
@@ -714,108 +778,154 @@ def insert_optional_consumption(batch_id: str, branch_code: str, sales_date: dat
             "product_code": str(r.get("product_code") or ""),
             "item_name": str(r.get("item_name") or ""),
             "sold_qty": float(r.get("sold_qty") or 0),
-            "ingredient_code": str(r.get("ingredient_code") or ""),
+            "ingredient_code": str(r.get("ingredient_code") or "").strip().upper(),
             "used_qty": float(r.get("used_qty") or 0),
+            "consumption_source": source,
+            "calculation_note": str(r.get("calculation_note") or ""),
         })
-    try:
-        for i in range(0, len(payload), 500):
-            supabase.table("sales_recipe_consumption").insert(payload[i:i + 500]).execute()
-    except Exception:
-        pass
+    for i in range(0, len(payload), 500):
+        supabase.table("sales_recipe_consumption").insert(payload[i:i + 500]).execute()
 
 
-def save_stock_day_snapshot(branch_code: str, snapshot_date: date) -> None:
-    """Optional table for analysts. If table missing, silently skip."""
-    current = get_current_stock(branch_code)
-    if current.empty:
-        return
-
-    ledger = get_stock_ledger_raw(branch_code)
+# ============================================================
+# Reports
+# ============================================================
+def get_stock_ledger_report(branch_code: str, limit: Optional[int] = None) -> pd.DataFrame:
+    ledger = get_stock_ledger_raw(branch_code, limit=limit)
     if ledger.empty:
-        movements = pd.DataFrame(columns=["ingredient_code", "purchase_in", "adjustment_in", "sales_out", "adjustment_out", "other_in", "other_out"])
-    else:
-        ledger["transaction_datetime"] = pd.to_datetime(ledger["transaction_datetime"], errors="coerce")
-        day_ledger = ledger[ledger["transaction_datetime"].dt.date == snapshot_date].copy()
+        return ledger
 
-        def classify(row):
-            m = str(row.get("movement_type") or "").lower()
-            if "purchase" in m:
-                return "purchase_in"
-            if "sales" in m:
-                return "sales_out"
-            if float(row.get("qty_in") or 0) > 0:
-                return "adjustment_in"
-            if float(row.get("qty_out") or 0) > 0:
-                return "adjustment_out"
-            return "other"
+    ingredients = get_ingredients(include_inactive=True)
+    if not ingredients.empty:
+        ledger = ledger.merge(
+            ingredients[["ingredient_code", "ingredient_name", "base_unit", "source_type"]],
+            on="ingredient_code",
+            how="left",
+        )
 
-        if day_ledger.empty:
-            movements = pd.DataFrame(columns=["ingredient_code", "purchase_in", "adjustment_in", "sales_out", "adjustment_out", "other_in", "other_out"])
-        else:
-            day_ledger["bucket"] = day_ledger.apply(classify, axis=1)
-            rows = []
-            for ing, g in day_ledger.groupby("ingredient_code"):
-                rows.append({
-                    "ingredient_code": ing,
-                    "purchase_in": float(g.loc[g["bucket"] == "purchase_in", "qty_in"].sum()),
-                    "adjustment_in": float(g.loc[g["bucket"] == "adjustment_in", "qty_in"].sum()),
-                    "sales_out": float(g.loc[g["bucket"] == "sales_out", "qty_out"].sum()),
-                    "adjustment_out": float(g.loc[g["bucket"] == "adjustment_out", "qty_out"].sum()),
-                    "other_in": float(g.loc[g["bucket"] == "other", "qty_in"].sum()),
-                    "other_out": float(g.loc[g["bucket"] == "other", "qty_out"].sum()),
-                })
-            movements = pd.DataFrame(rows)
+    cols = [
+        "transaction_id", "transaction_datetime", "branch_code", "ingredient_name",
+        "ingredient_code", "base_unit", "source_type", "movement_type", "qty_in", "qty_out",
+        "reference_type", "reference_id", "note",
+    ]
+    for col in cols:
+        if col not in ledger.columns:
+            ledger[col] = None
+    return ledger[cols]
 
-    snap = current.merge(movements, on="ingredient_code", how="left")
-    for col in ["purchase_in", "adjustment_in", "sales_out", "adjustment_out", "other_in", "other_out"]:
-        snap[col] = pd.to_numeric(snap.get(col, 0), errors="coerce").fillna(0)
-    snap["closing_qty"] = pd.to_numeric(snap["current_qty"], errors="coerce").fillna(0)
-    snap["opening_qty"] = snap["closing_qty"] - snap["purchase_in"] - snap["adjustment_in"] - snap["other_in"] + snap["sales_out"] + snap["adjustment_out"] + snap["other_out"]
 
-    payload = []
-    for _, r in snap.iterrows():
-        payload.append({
-            "branch_code": branch_code,
-            "snapshot_date": snapshot_date.isoformat(),
-            "ingredient_code": str(r["ingredient_code"]),
-            "ingredient_name": str(r.get("ingredient_name") or ""),
-            "base_unit": str(r.get("base_unit") or ""),
-            "opening_qty": float(r.get("opening_qty") or 0),
-            "purchase_in": float(r.get("purchase_in") or 0),
-            "adjustment_in": float(r.get("adjustment_in") or 0),
-            "sales_out": float(r.get("sales_out") or 0),
-            "adjustment_out": float(r.get("adjustment_out") or 0),
-            "other_in": float(r.get("other_in") or 0),
-            "other_out": float(r.get("other_out") or 0),
-            "closing_qty": float(r.get("closing_qty") or 0),
-            "saved_at": datetime.now().isoformat(timespec="seconds"),
-        })
+def get_purchase_bills_report(branch_code: str) -> pd.DataFrame:
+    supabase = get_supabase_client()
     try:
-        supabase = get_supabase_client()
-        # Remove previous snapshot for that branch/date if the table supports delete.
-        try:
-            supabase.table("stock_day_snapshot").delete().eq("branch_code", branch_code).eq("snapshot_date", snapshot_date.isoformat()).execute()
-        except Exception:
-            pass
-        for i in range(0, len(payload), 500):
-            supabase.table("stock_day_snapshot").insert(payload[i:i + 500]).execute()
-    except Exception:
-        pass
+        result = (
+            supabase.table("purchase_bill_header")
+            .select("*")
+            .eq("branch_code", branch_code)
+            .order("bill_id", desc=True)
+            .execute()
+        )
+        return result_to_df(result)
+    except Exception as e:
+        st.error(f"Could not read purchase_bill_header table. Error: {e}")
+        return pd.DataFrame()
 
 
-# -----------------------------
+def get_purchase_bill_lines_report(branch_code: str) -> pd.DataFrame:
+    headers = get_purchase_bills_report(branch_code)
+    if headers.empty:
+        return pd.DataFrame()
+
+    bill_ids = headers["bill_id"].tolist()
+    supabase = get_supabase_client()
+    try:
+        lines = result_to_df(
+            supabase.table("purchase_bill_lines")
+            .select("*")
+            .in_("bill_id", bill_ids)
+            .order("line_id")
+            .execute()
+        )
+    except Exception as e:
+        st.error(f"Could not read purchase_bill_lines table. Error: {e}")
+        return pd.DataFrame()
+
+    if lines.empty:
+        return pd.DataFrame()
+
+    ingredients = get_ingredients(include_inactive=True)
+    merged = lines.merge(
+        headers[["bill_id", "branch_code", "bill_date", "supplier_name", "invoice_no"]],
+        on="bill_id",
+        how="left",
+    )
+    if not ingredients.empty:
+        merged = merged.merge(
+            ingredients[["ingredient_code", "ingredient_name", "base_unit"]],
+            on="ingredient_code",
+            how="left",
+        )
+
+    cols = [
+        "bill_id", "branch_code", "bill_date", "supplier_name", "invoice_no",
+        "ingredient_name", "ingredient_code", "qty", "unit", "base_qty",
+        "total_price", "unit_price", "expiry_date",
+    ]
+    for col in cols:
+        if col not in merged.columns:
+            merged[col] = None
+    return merged[cols].sort_values(["bill_id", "ingredient_name"], ascending=[False, True])
+
+
+def get_supplier_price_history_report(branch_code: str) -> pd.DataFrame:
+    df = get_purchase_bill_lines_report(branch_code)
+    if df.empty:
+        return df
+    cols = [
+        "bill_date", "supplier_name", "invoice_no", "ingredient_name", "ingredient_code",
+        "base_qty", "unit", "total_price", "unit_price",
+    ]
+    result = df[cols].copy()
+    result["unit_price"] = pd.to_numeric(result["unit_price"], errors="coerce").round(3)
+    return result.sort_values(["ingredient_name", "bill_date"], ascending=[True, False])
+
+
+def get_prep_production_report(branch_code: str) -> pd.DataFrame:
+    supabase = get_supabase_client()
+    try:
+        batches = result_to_df(
+            supabase.table("prep_production_batches")
+            .select("*")
+            .eq("branch_code", branch_code)
+            .order("prep_batch_id", desc=True)
+            .execute()
+        )
+    except Exception as e:
+        st.error(f"Could not read prep_production_batches. Error: {e}")
+        return pd.DataFrame()
+    return batches
+
+
+# ============================================================
 # UI helpers
-# -----------------------------
-def section_title(title: str, caption: str | None = None):
+# ============================================================
+def section_title(title: str, caption: Optional[str] = None):
     st.subheader(title)
     if caption:
         st.caption(caption)
 
 
-def ingredient_options_with_units(ingredients: pd.DataFrame):
-    labels = {}
+def ingredient_options_with_units(ingredients: pd.DataFrame) -> Dict[str, pd.Series]:
+    labels: Dict[str, pd.Series] = {}
     for _, row in ingredients.iterrows():
         label = f'{row["ingredient_code"]} - {row["ingredient_name"]} ({row["base_unit"]})'
+        labels[label] = row
+    return labels
+
+
+def product_options(products: pd.DataFrame) -> Dict[str, pd.Series]:
+    labels: Dict[str, pd.Series] = {}
+    for _, row in products.iterrows():
+        label = f'{row["product_code"]} - {row["item_name"]}'
         labels[label] = row
     return labels
 
@@ -825,9 +935,39 @@ def show_download_button(df: pd.DataFrame, file_name: str, label: str = "Downloa
     st.download_button(label, data=csv, file_name=file_name, mime="text/csv", use_container_width=True)
 
 
-# -----------------------------
+def post_ledger_for_consumption(
+    branch_code: str,
+    target_date: date,
+    consumption_summary: pd.DataFrame,
+    movement_type: str,
+    reference_type: str,
+    reference_id: str,
+    note: str,
+    transaction_time: time = time(23, 59, 0),
+) -> None:
+    tx_dt = datetime.combine(target_date, transaction_time)
+    ledger_payload = []
+    for _, r in consumption_summary.iterrows():
+        qty = as_float(r.get("used_qty"))
+        if qty <= 0:
+            continue
+        ledger_payload.append({
+            "transaction_datetime": tx_dt.isoformat(timespec="seconds"),
+            "branch_code": branch_code,
+            "ingredient_code": str(r["ingredient_code"]).strip().upper(),
+            "movement_type": movement_type,
+            "qty_in": 0,
+            "qty_out": qty,
+            "reference_type": reference_type,
+            "reference_id": reference_id,
+            "note": note,
+        })
+    insert_ledger_many(ledger_payload)
+
+
+# ============================================================
 # Pages
-# -----------------------------
+# ============================================================
 def page_dashboard(branch_code: str):
     section_title("Dashboard", "Quick stock status for your branch.")
     stock = get_current_stock(branch_code)
@@ -838,20 +978,23 @@ def page_dashboard(branch_code: str):
     total_items = len(stock)
     low_items = int((stock["status"] == "Low").sum())
     out_items = int((stock["status"] == "Out of Stock").sum())
-    c1, c2, c3 = st.columns(3)
+    neg_items = int((stock["status"] == "Negative").sum())
+
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("Total Items", total_items)
-    c2.metric("Low Stock Items", low_items)
-    c3.metric("Out of Stock Items", out_items)
+    c2.metric("Low Stock", low_items)
+    c3.metric("Out of Stock", out_items)
+    c4.metric("Negative Stock", neg_items)
 
     st.divider()
-    st.write("### Low / Out of Stock Items")
-    problem = stock[stock["status"].isin(["Low", "Out of Stock"])]
+    st.write("### Problem stock")
+    problem = stock[stock["status"].isin(["Low", "Out of Stock", "Negative"])]
     if problem.empty:
-        st.success("No low-stock items for this branch.")
+        st.success("No low, out, or negative stock items for this branch.")
     else:
         st.dataframe(problem, use_container_width=True, hide_index=True)
 
-    st.write("### Latest Stock Movements")
+    st.write("### Latest stock movements")
     latest = get_stock_ledger_report(branch_code, limit=20)
     if latest.empty:
         st.info("No stock movements recorded yet.")
@@ -867,6 +1010,7 @@ def page_add_purchase(branch_code: str):
         return
 
     ingredient_labels = ingredient_options_with_units(ingredients)
+
     if "purchase_form_version" not in st.session_state:
         st.session_state.purchase_form_version = 0
     form_version = st.session_state.purchase_form_version
@@ -892,9 +1036,22 @@ def page_add_purchase(branch_code: str):
             hide_index=True,
             key=f"purchase_lines_editor_{form_version}",
             column_config={
-                "Ingredient": st.column_config.SelectboxColumn("Ingredient", options=list(ingredient_labels.keys()), required=True),
-                "Quantity In Base Unit": st.column_config.NumberColumn("Quantity In Base Unit", min_value=0.0, step=1.0, required=True),
-                "Total Price": st.column_config.NumberColumn("Total Price", min_value=0.0, step=1.0),
+                "Ingredient": st.column_config.SelectboxColumn(
+                    "Ingredient",
+                    options=list(ingredient_labels.keys()),
+                    required=True,
+                ),
+                "Quantity In Base Unit": st.column_config.NumberColumn(
+                    "Quantity In Base Unit",
+                    min_value=0.0,
+                    step=1.0,
+                    required=True,
+                ),
+                "Total Price": st.column_config.NumberColumn(
+                    "Total Price",
+                    min_value=0.0,
+                    step=1.0,
+                ),
                 "Expiry Date": st.column_config.DateColumn("Expiry Date", format="DD/MM/YYYY"),
             },
         )
@@ -908,6 +1065,7 @@ def page_add_purchase(branch_code: str):
 
         total_amount = float(valid_lines["Total Price"].fillna(0).sum())
         supabase = get_supabase_client()
+
         try:
             header_result = supabase.table("purchase_bill_header").insert({
                 "branch_code": branch_code,
@@ -918,22 +1076,23 @@ def page_add_purchase(branch_code: str):
                 "note": note,
                 "created_at": datetime.now().isoformat(timespec="seconds"),
             }).execute()
+
             if not header_result.data:
                 st.error("Purchase bill header was not saved. No bill ID returned.")
                 return
-            bill_id = header_result.data[0]["bill_id"]
 
+            bill_id = header_result.data[0]["bill_id"]
             bill_lines_payload = []
             ledger_payload = []
+
             for _, line in valid_lines.iterrows():
                 selected_row = ingredient_labels[line["Ingredient"]]
-                ingredient_code = selected_row["ingredient_code"]
-                base_unit = selected_row["base_unit"]
-                base_qty = float(line["Quantity In Base Unit"])
-                total_price = float(line["Total Price"] or 0)
+                ingredient_code = str(selected_row["ingredient_code"]).strip().upper()
+                base_unit = str(selected_row["base_unit"]).strip()
+                base_qty = as_float(line["Quantity In Base Unit"])
+                total_price = as_float(line["Total Price"])
                 unit_price = total_price / base_qty if base_qty else 0
-                raw_expiry_date = line.get("Expiry Date")
-                expiry_date = None if pd.isna(raw_expiry_date) or raw_expiry_date is None else pd.to_datetime(raw_expiry_date).date().isoformat()
+                expiry_date = safe_iso_date(line.get("Expiry Date"))
 
                 bill_lines_payload.append({
                     "bill_id": bill_id,
@@ -958,22 +1117,34 @@ def page_add_purchase(branch_code: str):
                 })
 
             supabase.table("purchase_bill_lines").insert(bill_lines_payload).execute()
-            supabase.table("stock_ledger").insert(ledger_payload).execute()
+            insert_ledger_many(ledger_payload)
+
             st.success(f"Purchase bill saved. Bill ID: {bill_id}")
             st.session_state.purchase_form_version += 1
             st.rerun()
+
         except Exception as e:
             st.error(f"Could not save purchase bill. Error: {e}")
 
 
 def page_stock_count(branch_code: str):
-    section_title("Opening / Physical Stock Count", "Records only the difference between system stock and physical stock.")
+    section_title(
+        "Opening / Physical Stock Count",
+        "Records only the difference between system stock and physical stock. Negative stock is allowed before count correction.",
+    )
     stock = get_current_stock(branch_code)
     if stock.empty:
         st.warning("No ingredients found.")
         return
 
-    count_df = stock[["ingredient_code", "ingredient_name", "base_unit", "current_qty"]].copy()
+    type_filter = st.multiselect(
+        "Item Type",
+        ["Purchased", "Produced", "Both"],
+        default=["Purchased", "Produced", "Both"],
+    )
+    stock = stock[stock["source_type"].isin(type_filter)].copy()
+
+    count_df = stock[["ingredient_code", "ingredient_name", "source_type", "base_unit", "current_qty"]].copy()
     count_df["physical_qty"] = count_df["current_qty"]
     count_df["reason"] = ""
 
@@ -984,9 +1155,10 @@ def page_stock_count(branch_code: str):
         column_config={
             "ingredient_code": st.column_config.TextColumn("Code", disabled=True),
             "ingredient_name": st.column_config.TextColumn("Ingredient", disabled=True),
+            "source_type": st.column_config.TextColumn("Type", disabled=True),
             "base_unit": st.column_config.TextColumn("Unit", disabled=True),
             "current_qty": st.column_config.NumberColumn("System Stock", disabled=True),
-            "physical_qty": st.column_config.NumberColumn("Physical Count", min_value=0.0, step=1.0),
+            "physical_qty": st.column_config.NumberColumn("Physical Count", step=1.0),
             "reason": st.column_config.TextColumn("Reason / Note"),
         },
     )
@@ -995,8 +1167,8 @@ def page_stock_count(branch_code: str):
         changes = 0
         try:
             for _, row in edited.iterrows():
-                system_qty = float(row["current_qty"] or 0)
-                physical_qty = float(row["physical_qty"] or 0)
+                system_qty = as_float(row["current_qty"])
+                physical_qty = as_float(row["physical_qty"])
                 diff = round(physical_qty - system_qty, 6)
                 if abs(diff) > 0.000001:
                     add_stock_ledger(
@@ -1017,19 +1189,31 @@ def page_stock_count(branch_code: str):
 
 
 def page_adjustment(branch_code: str):
-    section_title("Stock Adjustment", "Use for wastage, correction, staff meal, transfer, or other manual movement.")
+    section_title("Stock Adjustment", "Use for ingredient wastage, prep wastage, correction, staff meal, transfer, or other movement.")
     ingredients = get_ingredients()
     if ingredients.empty:
         st.warning("No ingredients found in Supabase.")
         return
 
     ingredient_labels = ingredient_options_with_units(ingredients)
+
     with st.form("adjustment_form"):
         movement_type = st.selectbox(
             "Movement Type",
-            ["Wastage", "Correction In", "Correction Out", "Transfer In", "Transfer Out", "Staff Meal", "Sample / Testing", "Other In", "Other Out"],
+            [
+                "Ingredient Wastage",
+                "Prep Item Wastage",
+                "Correction In",
+                "Correction Out",
+                "Transfer In",
+                "Transfer Out",
+                "Staff Meal",
+                "Sample / Testing",
+                "Other In",
+                "Other Out",
+            ],
         )
-        selected_ingredient = st.selectbox("Ingredient", list(ingredient_labels.keys()))
+        selected_ingredient = st.selectbox("Ingredient / Prep Item", list(ingredient_labels.keys()))
         qty = st.number_input("Quantity In Base Unit", min_value=0.0, step=1.0)
         note = st.text_area("Reason / Note", placeholder="Example: spoiled, branch transfer, wrong count correction")
         submitted = st.form_submit_button("Save Adjustment", use_container_width=True)
@@ -1038,11 +1222,22 @@ def page_adjustment(branch_code: str):
         if qty <= 0:
             st.error("Quantity must be greater than zero.")
             return
+
         ingredient_code = ingredient_labels[selected_ingredient]["ingredient_code"]
         in_types = ["Correction In", "Transfer In", "Other In"]
         qty_in, qty_out = (qty, 0) if movement_type in in_types else (0, qty)
+
         try:
-            add_stock_ledger(branch_code, ingredient_code, movement_type, qty_in, qty_out, "Manual Adjustment", date.today().isoformat(), note)
+            add_stock_ledger(
+                branch_code=branch_code,
+                ingredient_code=ingredient_code,
+                movement_type=movement_type,
+                qty_in=qty_in,
+                qty_out=qty_out,
+                reference_type="Manual Adjustment",
+                reference_id=date.today().isoformat(),
+                note=note,
+            )
             st.success("Adjustment saved.")
             st.rerun()
         except Exception as e:
@@ -1050,12 +1245,14 @@ def page_adjustment(branch_code: str):
 
 
 def page_sales_upload(branch_code: str):
-    section_title("Sales Report Upload", "Upload POS sales report. Recipe usage will be posted to stock ledger.")
+    section_title(
+        "Sales Report Upload",
+        "Uploads POS sales. Direct ingredients and countable prep are deducted; virtual prep is backflushed to raw materials.",
+    )
 
     sales_date = st.date_input("Sales Date", value=date.today())
     uploaded_file = st.file_uploader("Upload Sales Report", type=["csv", "xlsx", "xls"])
-
-    st.caption("The selected Sales Date must match the date inside the uploaded report. If uploading yesterday's report, select yesterday before uploading.")
+    st.caption("Selected Sales Date must match the date inside the uploaded report.")
 
     if not uploaded_file:
         return
@@ -1071,6 +1268,7 @@ def page_sales_upload(branch_code: str):
     if len(dates_in_file) != 1:
         st.error(f"Wrong file. This report contains multiple dates: {dates_in_file}")
         return
+
     file_date = dates_in_file[0]
     if file_date != sales_date:
         st.error(f"Wrong date file. Selected date is {sales_date}, but uploaded report date is {file_date}.")
@@ -1091,13 +1289,21 @@ def page_sales_upload(branch_code: str):
 
     products = get_products()
     recipe_df = get_recipe_ingredients()
+    sub_df = get_sub_recipes()
+
     if products.empty or recipe_df.empty:
-        st.error("Sales upload cannot continue until `products` and `recipe_ingredients` tables are created and filled.")
+        st.error("Sales upload cannot continue until products and recipe_ingredients are filled.")
         return
 
     check = sold_items.copy()
     check["item_name_clean"] = check["item_name"].astype(str).str.strip().str.lower()
-    mapped = check.merge(products[["product_code", "item_name", "item_name_clean"]], on="item_name_clean", how="left", suffixes=("_sales", "_product"))
+    mapped = check.merge(
+        products[["product_code", "item_name", "item_name_clean"]],
+        on="item_name_clean",
+        how="left",
+        suffixes=("_sales", "_product"),
+    )
+
     missing_map = mapped[mapped["product_code"].isna()]
     if not missing_map.empty:
         st.error("Some POS items are not mapped in products table. Add these items first.")
@@ -1106,11 +1312,12 @@ def page_sales_upload(branch_code: str):
 
     consumption_rows = []
     missing_recipe = []
+
     try:
         for _, item in mapped.iterrows():
             product_code = str(item["product_code"]).strip().upper()
-            sold_qty = float(item["sold_qty"] or 0)
-            exploded = explode_recipe_for_parent(recipe_df, "Product", product_code, sold_qty)
+            sold_qty = as_float(item["sold_qty"])
+            exploded = calculate_product_consumption(product_code, sold_qty, recipe_df, sub_df)
             if not exploded:
                 missing_recipe.append({
                     "product_code": product_code,
@@ -1118,20 +1325,22 @@ def page_sales_upload(branch_code: str):
                     "sold_qty": sold_qty,
                 })
                 continue
+
             for e in exploded:
                 consumption_rows.append({
                     "product_code": product_code,
                     "item_name": item["item_name_sales"],
                     "sold_qty": sold_qty,
                     "ingredient_code": e["ingredient_code"],
-                    "used_qty": float(e["used_qty"] or 0),
+                    "used_qty": as_float(e["used_qty"]),
+                    "calculation_note": e.get("calculation_note", ""),
                 })
     except Exception as e:
-        st.error(f"Recipe explosion failed. Error: {e}")
+        st.error(f"Recipe calculation failed. Error: {e}")
         return
 
     if missing_recipe:
-        st.error("Some products have no recipe lines in recipe_ingredients table.")
+        st.error("Some products have no active recipe lines in recipe_ingredients table.")
         st.dataframe(pd.DataFrame(missing_recipe), use_container_width=True, hide_index=True)
         return
 
@@ -1140,49 +1349,329 @@ def page_sales_upload(branch_code: str):
         st.error("No recipe consumption calculated.")
         return
 
-    consumption_summary = (
-        consumption.groupby(["ingredient_code"], as_index=False)
-        .agg(used_qty=("used_qty", "sum"))
-    )
-    ingredients = get_ingredients(include_inactive=True)
-    if not ingredients.empty:
-        consumption_summary = consumption_summary.merge(
-            ingredients[["ingredient_code", "ingredient_name", "base_unit"]],
-            on="ingredient_code",
-            how="left",
-        )
-    st.write("### Calculated ingredient consumption")
+    consumption_summary = consumption.groupby(["ingredient_code"], as_index=False).agg(used_qty=("used_qty", "sum"))
+    consumption_summary = enrich_ingredients(consumption_summary)
+    st.write("### Calculated stock deduction")
     st.dataframe(consumption_summary, use_container_width=True, hide_index=True)
 
+    with st.expander("Calculation detail by product"):
+        detail = enrich_ingredients(consumption)
+        st.dataframe(detail, use_container_width=True, hide_index=True)
+
     if st.button("Post Sales Consumption to Stock Ledger", use_container_width=True):
-        supabase = get_supabase_client()
-        batch_id = create_sales_batch_if_table_exists(branch_code, sales_date, uploaded_file.name, len(success_df))
-        insert_optional_sales_lines(batch_id, branch_code, sales_date, success_df)
-        insert_optional_consumption(batch_id, branch_code, sales_date, consumption)
-
-        tx_dt = datetime.combine(sales_date, time(23, 59, 0))
-        ledger_payload = []
-        for _, r in consumption_summary.iterrows():
-            ledger_payload.append({
-                "transaction_datetime": tx_dt.isoformat(timespec="seconds"),
-                "branch_code": branch_code,
-                "ingredient_code": str(r["ingredient_code"]),
-                "movement_type": "Sales Recipe Consumption",
-                "qty_in": 0,
-                "qty_out": float(r["used_qty"] or 0),
-                "reference_type": "Sales Upload",
-                "reference_id": batch_id,
-                "note": f"Sales report {uploaded_file.name} for {sales_date.isoformat()}",
-            })
-
         try:
-            for i in range(0, len(ledger_payload), 500):
-                supabase.table("stock_ledger").insert(ledger_payload[i:i + 500]).execute()
+            batch_id = create_sales_batch(branch_code, sales_date, uploaded_file.name, len(success_df))
+            insert_sales_lines(batch_id, branch_code, sales_date, success_df)
+            insert_consumption_rows(batch_id, branch_code, sales_date, consumption, source="Sales")
+
+            post_ledger_for_consumption(
+                branch_code=branch_code,
+                target_date=sales_date,
+                consumption_summary=consumption_summary,
+                movement_type="Sales Recipe Consumption",
+                reference_type="Sales Upload",
+                reference_id=batch_id,
+                note=f"Sales report {uploaded_file.name} for {sales_date.isoformat()}",
+                transaction_time=time(23, 59, 0),
+            )
+
             save_stock_day_snapshot(branch_code, sales_date)
             st.success(f"Sales consumption posted. Batch ID: {batch_id}")
             st.rerun()
+
         except Exception as e:
-            st.error(f"Could not post sales consumption to stock_ledger. Error: {e}")
+            st.error(f"Could not post sales consumption. Error: {e}")
+
+
+def page_finished_product_wastage(branch_code: str):
+    section_title(
+        "Finished Product Wastage",
+        "Use when a completed item is wasted. The app deducts the same ingredients/prep as a sale, but marks it as finished product wastage.",
+    )
+    products = get_products()
+    recipe_df = get_recipe_ingredients()
+    sub_df = get_sub_recipes()
+
+    if products.empty or recipe_df.empty:
+        st.warning("Products and recipe_ingredients must be filled first.")
+        return
+
+    labels = product_options(products)
+
+    with st.form("finished_product_wastage_form"):
+        wastage_date = st.date_input("Wastage Date", value=date.today())
+        selected_product = st.selectbox("Finished Product", list(labels.keys()))
+        qty = st.number_input("Wasted Quantity", min_value=0.0, step=1.0)
+        note = st.text_area("Reason", placeholder="Example: wrong order, dropped item, burnt item")
+        submitted = st.form_submit_button("Calculate Wastage", use_container_width=True)
+
+    if not submitted:
+        return
+
+    if qty <= 0:
+        st.error("Quantity must be greater than zero.")
+        return
+
+    product_row = labels[selected_product]
+    product_code = str(product_row["product_code"]).strip().upper()
+    item_name = str(product_row["item_name"])
+
+    try:
+        exploded = calculate_product_consumption(product_code, qty, recipe_df, sub_df)
+    except Exception as e:
+        st.error(f"Recipe calculation failed. Error: {e}")
+        return
+
+    if not exploded:
+        st.error("No recipe found for this product.")
+        return
+
+    consumption = pd.DataFrame([
+        {
+            "product_code": product_code,
+            "item_name": item_name,
+            "sold_qty": qty,
+            "ingredient_code": r["ingredient_code"],
+            "used_qty": r["used_qty"],
+            "calculation_note": r.get("calculation_note", ""),
+        }
+        for r in exploded
+    ])
+    summary = consumption.groupby("ingredient_code", as_index=False).agg(used_qty=("used_qty", "sum"))
+    summary = enrich_ingredients(summary)
+
+    st.write("### Stock deduction for this wastage")
+    st.dataframe(summary, use_container_width=True, hide_index=True)
+
+    if st.button("Post Finished Product Wastage", use_container_width=True):
+        try:
+            ref_id = f"FPW-{branch_code}-{wastage_date.isoformat()}-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+            post_ledger_for_consumption(
+                branch_code=branch_code,
+                target_date=wastage_date,
+                consumption_summary=summary,
+                movement_type="Finished Product Wastage Consumption",
+                reference_type="Finished Product Wastage",
+                reference_id=ref_id,
+                note=f"{item_name} x {qty}. Reason: {note}",
+                transaction_time=datetime.now().time().replace(microsecond=0),
+            )
+            save_stock_day_snapshot(branch_code, wastage_date)
+            st.success("Finished product wastage posted.")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Could not post finished product wastage. Error: {e}")
+
+
+def get_countable_prep_table() -> pd.DataFrame:
+    sub_df = get_sub_recipes()
+    ingredients = get_ingredients(include_inactive=True)
+    if sub_df.empty:
+        return pd.DataFrame()
+
+    countable = sub_df[sub_df["prep_type"].str.lower() == "countable"].copy()
+    if ingredients.empty:
+        return countable
+
+    countable = countable.merge(
+        ingredients[["ingredient_code", "ingredient_name", "base_unit"]],
+        left_on="output_ingredient_code",
+        right_on="ingredient_code",
+        how="left",
+    )
+    return countable
+
+
+def page_auto_prep_production(branch_code: str):
+    section_title(
+        "Auto Prep Production From Count",
+        "Calculates prepared qty = closing physical + sales usage + prep wastage - opening stock, then deducts raw materials from SOP.",
+    )
+
+    production_date = st.date_input("Production Date", value=date.today() - timedelta(days=1))
+    countable = get_countable_prep_table()
+    recipe_df = get_recipe_ingredients()
+    sub_df = get_sub_recipes()
+
+    if countable.empty:
+        st.warning("No countable prep items found. Add sub_recipes with prep_type='Countable'.")
+        return
+
+    day_ledger = get_day_ledger(branch_code, production_date)
+    rows = []
+
+    start_dt = datetime.combine(production_date, time(0, 0, 0))
+    end_dt = datetime.combine(production_date + timedelta(days=1), time(0, 0, 0))
+
+    for _, prep in countable.iterrows():
+        output_ing = str(prep["output_ingredient_code"]).strip().upper()
+        opening_qty = get_stock_as_of(branch_code, output_ing, start_dt)
+        current_end_before_next_day = get_stock_as_of(branch_code, output_ing, end_dt)
+
+        if day_ledger.empty:
+            sales_usage = 0.0
+            wastage_qty = 0.0
+        else:
+            same_ing = day_ledger[day_ledger["ingredient_code"] == output_ing]
+            sales_usage = float(same_ing[same_ing["movement_type"] == "Sales Recipe Consumption"]["qty_out"].sum())
+            wastage_qty = float(same_ing[same_ing["movement_type"].isin(["Prep Item Wastage"])]["qty_out"].sum())
+
+        rows.append({
+            "Sub Recipe Code": prep["sub_recipe_code"],
+            "Prep Item": prep.get("ingredient_name") or prep.get("sub_recipe_name"),
+            "Output Ingredient Code": output_ing,
+            "Unit": prep.get("base_unit") or prep.get("output_unit"),
+            "Opening Qty": opening_qty,
+            "Sales Usage Qty": sales_usage,
+            "Prep Wastage Qty": wastage_qty,
+            "System End Qty": current_end_before_next_day,
+            "Closing Physical Qty": current_end_before_next_day,
+            "Note": "",
+        })
+
+    calc_df = pd.DataFrame(rows)
+
+    edited = st.data_editor(
+        calc_df,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Sub Recipe Code": st.column_config.TextColumn(disabled=True),
+            "Prep Item": st.column_config.TextColumn(disabled=True),
+            "Output Ingredient Code": st.column_config.TextColumn(disabled=True),
+            "Unit": st.column_config.TextColumn(disabled=True),
+            "Opening Qty": st.column_config.NumberColumn(disabled=True),
+            "Sales Usage Qty": st.column_config.NumberColumn(disabled=True),
+            "Prep Wastage Qty": st.column_config.NumberColumn(disabled=True),
+            "System End Qty": st.column_config.NumberColumn(disabled=True),
+            "Closing Physical Qty": st.column_config.NumberColumn(step=1.0),
+            "Note": st.column_config.TextColumn(),
+        },
+    )
+
+    edited["Prepared Qty"] = (
+        pd.to_numeric(edited["Closing Physical Qty"], errors="coerce").fillna(0)
+        + pd.to_numeric(edited["Sales Usage Qty"], errors="coerce").fillna(0)
+        + pd.to_numeric(edited["Prep Wastage Qty"], errors="coerce").fillna(0)
+        - pd.to_numeric(edited["Opening Qty"], errors="coerce").fillna(0)
+    )
+    positive = edited[edited["Prepared Qty"] > 0].copy()
+
+    st.write("### Calculated prep production")
+    st.dataframe(edited, use_container_width=True, hide_index=True)
+
+    if positive.empty:
+        st.info("No positive prepared quantity calculated.")
+        return
+
+    st.write("### Raw material deduction preview")
+    preview_rows = []
+    error_messages = []
+    for _, r in positive.iterrows():
+        sub_code = str(r["Sub Recipe Code"]).strip().upper()
+        prepared_qty = as_float(r["Prepared Qty"])
+        try:
+            raw_df = calculate_sub_recipe_raw_consumption(sub_code, prepared_qty, recipe_df, sub_df)
+            for _, raw in raw_df.iterrows():
+                preview_rows.append({
+                    "Sub Recipe Code": sub_code,
+                    "Prep Item": r["Prep Item"],
+                    "Prepared Qty": prepared_qty,
+                    "Component Ingredient Code": raw["ingredient_code"],
+                    "Raw Used Qty": raw["used_qty"],
+                })
+        except Exception as e:
+            error_messages.append(f"{sub_code}: {e}")
+
+    if error_messages:
+        st.error("Some prep calculations failed:")
+        for msg in error_messages:
+            st.write("- " + msg)
+        return
+
+    preview = pd.DataFrame(preview_rows)
+    preview = enrich_ingredients(preview, code_col="Component Ingredient Code")
+    st.dataframe(preview, use_container_width=True, hide_index=True)
+
+    if st.button("Post Auto Prep Production", use_container_width=True):
+        try:
+            supabase = get_supabase_client()
+            for _, r in positive.iterrows():
+                sub_code = str(r["Sub Recipe Code"]).strip().upper()
+                output_ing = str(r["Output Ingredient Code"]).strip().upper()
+                prepared_qty = as_float(r["Prepared Qty"])
+                output_unit = str(r.get("Unit") or "")
+                note = str(r.get("Note") or "")
+
+                batch_result = supabase.table("prep_production_batches").insert({
+                    "branch_code": branch_code,
+                    "production_date": production_date.isoformat(),
+                    "sub_recipe_code": sub_code,
+                    "output_ingredient_code": output_ing,
+                    "prepared_qty": prepared_qty,
+                    "output_unit": output_unit,
+                    "calculation_type": "Auto From Count",
+                    "opening_qty": as_float(r["Opening Qty"]),
+                    "sales_usage_qty": as_float(r["Sales Usage Qty"]),
+                    "wastage_qty": as_float(r["Prep Wastage Qty"]),
+                    "closing_physical_qty": as_float(r["Closing Physical Qty"]),
+                    "note": note,
+                    "created_at": datetime.now().isoformat(timespec="seconds"),
+                    "created_by": st.session_state.get("username"),
+                }).execute()
+
+                prep_batch_id = batch_result.data[0]["prep_batch_id"]
+                tx_dt = datetime.combine(production_date, time(23, 58, 0))
+
+                # Output stock in
+                add_stock_ledger(
+                    branch_code=branch_code,
+                    ingredient_code=output_ing,
+                    movement_type="Prep Production Output",
+                    qty_in=prepared_qty,
+                    qty_out=0,
+                    reference_type="Auto Prep Production",
+                    reference_id=str(prep_batch_id),
+                    note=f"{sub_code} auto production. {note}",
+                    transaction_datetime=tx_dt,
+                )
+
+                # Raw/input stock out
+                raw_df = calculate_sub_recipe_raw_consumption(sub_code, prepared_qty, recipe_df, sub_df)
+                line_payload = []
+                ledger_payload = []
+                for _, raw in raw_df.iterrows():
+                    component_ing = str(raw["ingredient_code"]).strip().upper()
+                    used_qty = as_float(raw["used_qty"])
+                    line_payload.append({
+                        "prep_batch_id": prep_batch_id,
+                        "component_ingredient_code": component_ing,
+                        "used_qty": used_qty,
+                        "unit": None,
+                        "note": f"Raw consumption for {sub_code}",
+                    })
+                    ledger_payload.append({
+                        "transaction_datetime": tx_dt.isoformat(timespec="seconds"),
+                        "branch_code": branch_code,
+                        "ingredient_code": component_ing,
+                        "movement_type": "Prep Production Consumption",
+                        "qty_in": 0,
+                        "qty_out": used_qty,
+                        "reference_type": "Auto Prep Production",
+                        "reference_id": str(prep_batch_id),
+                        "note": f"Raw material used to produce {sub_code}",
+                    })
+
+                if line_payload:
+                    supabase.table("prep_production_lines").insert(line_payload).execute()
+                insert_ledger_many(ledger_payload)
+
+            save_stock_day_snapshot(branch_code, production_date)
+            st.success("Auto prep production posted.")
+            st.rerun()
+
+        except Exception as e:
+            st.error(f"Could not post auto prep production. Error: {e}")
 
 
 def page_current_stock(branch_code: str):
@@ -1191,23 +1680,58 @@ def page_current_stock(branch_code: str):
     if stock.empty:
         st.warning("No stock data found.")
         return
-    status_filter = st.multiselect("Filter Status", ["OK", "Low", "Out of Stock"], default=["OK", "Low", "Out of Stock"])
-    filtered = stock[stock["status"].isin(status_filter)]
+
+    status_filter = st.multiselect(
+        "Filter Status",
+        ["OK", "Low", "Out of Stock", "Negative"],
+        default=["OK", "Low", "Out of Stock", "Negative"],
+    )
+    source_filter = st.multiselect(
+        "Source Type",
+        ["Purchased", "Produced", "Both"],
+        default=["Purchased", "Produced", "Both"],
+    )
+
+    filtered = stock[stock["status"].isin(status_filter) & stock["source_type"].isin(source_filter)]
     st.dataframe(filtered, use_container_width=True, hide_index=True)
     show_download_button(filtered, f"current_stock_{branch_code}.csv", "Download Current Stock CSV")
 
 
 def page_reports(branch_code: str):
     section_title("Reports", "Reports for your branch only.")
-    report = st.selectbox("Choose Report", ["Stock Ledger", "Purchase Bills", "Purchase Bill Lines", "Supplier Price History"])
+    report = st.selectbox(
+        "Choose Report",
+        [
+            "Stock Ledger",
+            "Purchase Bills",
+            "Purchase Bill Lines",
+            "Supplier Price History",
+            "Prep Production Batches",
+            "Products",
+            "Ingredients",
+            "Sub Recipes",
+            "Recipe Ingredients",
+        ],
+    )
+
     if report == "Stock Ledger":
         df = get_stock_ledger_report(branch_code)
     elif report == "Purchase Bills":
         df = get_purchase_bills_report(branch_code)
     elif report == "Purchase Bill Lines":
         df = get_purchase_bill_lines_report(branch_code)
-    else:
+    elif report == "Supplier Price History":
         df = get_supplier_price_history_report(branch_code)
+    elif report == "Prep Production Batches":
+        df = get_prep_production_report(branch_code)
+    elif report == "Products":
+        df = get_products(include_inactive=True)
+    elif report == "Ingredients":
+        df = get_ingredients(include_inactive=True)
+    elif report == "Sub Recipes":
+        df = get_sub_recipes(include_inactive=True)
+    else:
+        df = get_recipe_ingredients(include_inactive=True)
 
     if df.empty:
         st.info("No data found for this report.")
@@ -1216,9 +1740,275 @@ def page_reports(branch_code: str):
         show_download_button(df, f"{report.lower().replace(' ', '_')}_{branch_code}.csv", "Download Report CSV")
 
 
-# -----------------------------
+def page_recipe_validation():
+    section_title("Recipe Validation", "Checks missing mappings, missing sub recipes, missing ingredients, and possible circular references.")
+    ingredients = get_ingredients(include_inactive=True)
+    products = get_products(include_inactive=True)
+    sub_df = get_sub_recipes(include_inactive=True)
+    recipe_df = get_recipe_ingredients(include_inactive=True)
+
+    if recipe_df.empty:
+        st.warning("No recipe_ingredients rows found.")
+        return
+
+    issues = []
+
+    ingredient_codes = set(ingredients["ingredient_code"].astype(str).str.upper()) if not ingredients.empty else set()
+    product_codes = set(products["product_code"].astype(str).str.upper()) if not products.empty else set()
+    sub_codes = set(sub_df["sub_recipe_code"].astype(str).str.upper()) if not sub_df.empty else set()
+
+    for _, row in recipe_df.iterrows():
+        parent_type = str(row["parent_type"]).strip()
+        parent_code = str(row["parent_code"]).strip().upper()
+        component_type = str(row["component_type"]).strip()
+        component_code = str(row["component_code"]).strip().upper()
+
+        if parent_type == "Product" and parent_code not in product_codes:
+            issues.append({
+                "Issue": "Parent product missing",
+                "Code": parent_code,
+                "Recipe Line ID": row.get("recipe_line_id"),
+            })
+        if parent_type == "Sub Recipe" and parent_code not in sub_codes:
+            issues.append({
+                "Issue": "Parent sub recipe missing",
+                "Code": parent_code,
+                "Recipe Line ID": row.get("recipe_line_id"),
+            })
+        if component_type == "Ingredient" and component_code not in ingredient_codes:
+            issues.append({
+                "Issue": "Component ingredient missing",
+                "Code": component_code,
+                "Recipe Line ID": row.get("recipe_line_id"),
+            })
+        if component_type == "Sub Recipe" and component_code not in sub_codes:
+            issues.append({
+                "Issue": "Component sub recipe missing",
+                "Code": component_code,
+                "Recipe Line ID": row.get("recipe_line_id"),
+            })
+
+    if not sub_df.empty:
+        for _, sub in sub_df.iterrows():
+            output_ing = str(sub["output_ingredient_code"]).strip().upper()
+            if output_ing not in ingredient_codes:
+                issues.append({
+                    "Issue": "Sub recipe output ingredient missing",
+                    "Code": output_ing,
+                    "Recipe Line ID": sub["sub_recipe_code"],
+                })
+
+    # Try calculation for all products with qty 1 to catch circular/missing nested recipes.
+    active_recipe = get_recipe_ingredients()
+    active_sub = get_sub_recipes()
+    for _, product in get_products().iterrows():
+        try:
+            calculate_product_consumption(product["product_code"], 1, active_recipe, active_sub)
+        except Exception as e:
+            issues.append({
+                "Issue": "Calculation error",
+                "Code": product["product_code"],
+                "Recipe Line ID": "",
+                "Details": str(e),
+            })
+
+    if not issues:
+        st.success("No validation issues found.")
+    else:
+        issue_df = pd.DataFrame(issues)
+        st.dataframe(issue_df, use_container_width=True, hide_index=True)
+        show_download_button(issue_df, "recipe_validation_issues.csv")
+
+
+def classify_snapshot_bucket(row) -> Tuple[str, float]:
+    movement = str(row.get("movement_type") or "")
+    qty_in = as_float(row.get("qty_in"))
+    qty_out = as_float(row.get("qty_out"))
+
+    if movement == "Purchase":
+        return "purchase_in", qty_in
+    if movement == "Prep Production Output":
+        return "prep_output_in", qty_in
+    if movement in ["Correction In", "Physical Count Adjustment In"]:
+        return "adjustment_in", qty_in
+    if movement == "Transfer In":
+        return "transfer_in", qty_in
+    if movement == "Sales Recipe Consumption":
+        return "sales_out", qty_out
+    if movement == "Prep Production Consumption":
+        return "prep_consumption_out", qty_out
+    if movement in ["Ingredient Wastage", "Prep Item Wastage"]:
+        return "wastage_out", qty_out
+    if movement == "Finished Product Wastage Consumption":
+        return "finished_product_wastage_out", qty_out
+    if movement in ["Correction Out", "Physical Count Adjustment Out"]:
+        return "adjustment_out", qty_out
+    if movement == "Transfer Out":
+        return "transfer_out", qty_out
+    if qty_in > 0:
+        return "other_in", qty_in
+    return "other_out", qty_out
+
+
+def save_stock_day_snapshot(branch_code: str, snapshot_date: date) -> None:
+    current = get_current_stock(branch_code)
+    if current.empty:
+        return
+
+    ledger = get_stock_ledger_raw(branch_code)
+    bucket_cols = [
+        "purchase_in", "prep_output_in", "adjustment_in", "transfer_in",
+        "sales_out", "prep_consumption_out", "wastage_out",
+        "finished_product_wastage_out", "adjustment_out", "transfer_out",
+        "other_in", "other_out",
+    ]
+
+    movements = pd.DataFrame(columns=["ingredient_code"] + bucket_cols)
+
+    if not ledger.empty:
+        day_ledger = ledger[ledger["transaction_datetime"].dt.date == snapshot_date].copy()
+        rows = []
+        for ing, g in day_ledger.groupby("ingredient_code"):
+            rec = {"ingredient_code": ing}
+            for c in bucket_cols:
+                rec[c] = 0.0
+            for _, move in g.iterrows():
+                bucket, qty = classify_snapshot_bucket(move)
+                rec[bucket] += qty
+            rows.append(rec)
+        if rows:
+            movements = pd.DataFrame(rows)
+
+    snap = current.merge(movements, on="ingredient_code", how="left")
+    for c in bucket_cols:
+        snap[c] = pd.to_numeric(snap.get(c, 0), errors="coerce").fillna(0)
+
+    snap["system_closing_qty"] = pd.to_numeric(snap["current_qty"], errors="coerce").fillna(0)
+    snap["opening_qty"] = (
+        snap["system_closing_qty"]
+        - snap["purchase_in"]
+        - snap["prep_output_in"]
+        - snap["adjustment_in"]
+        - snap["transfer_in"]
+        + snap["sales_out"]
+        + snap["prep_consumption_out"]
+        + snap["wastage_out"]
+        + snap["finished_product_wastage_out"]
+        + snap["adjustment_out"]
+        + snap["transfer_out"]
+        + snap["other_out"]
+        - snap["other_in"]
+    )
+
+    payload = []
+    for _, r in snap.iterrows():
+        payload.append({
+            "branch_code": branch_code,
+            "snapshot_date": snapshot_date.isoformat(),
+            "ingredient_code": str(r["ingredient_code"]),
+            "ingredient_name": str(r.get("ingredient_name") or ""),
+            "base_unit": str(r.get("base_unit") or ""),
+            "opening_qty": as_float(r.get("opening_qty")),
+            "purchase_in": as_float(r.get("purchase_in")),
+            "prep_output_in": as_float(r.get("prep_output_in")),
+            "adjustment_in": as_float(r.get("adjustment_in")),
+            "transfer_in": as_float(r.get("transfer_in")),
+            "sales_out": as_float(r.get("sales_out")),
+            "prep_consumption_out": as_float(r.get("prep_consumption_out")),
+            "wastage_out": as_float(r.get("wastage_out")),
+            "finished_product_wastage_out": as_float(r.get("finished_product_wastage_out")),
+            "adjustment_out": as_float(r.get("adjustment_out")),
+            "transfer_out": as_float(r.get("transfer_out")),
+            "other_in": as_float(r.get("other_in")),
+            "other_out": as_float(r.get("other_out")),
+            "system_closing_qty": as_float(r.get("system_closing_qty")),
+            "physical_closing_qty": None,
+            "variance_qty": None,
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+        })
+
+    try:
+        supabase = get_supabase_client()
+        supabase.table("stock_day_snapshot").delete().eq("branch_code", branch_code).eq("snapshot_date", snapshot_date.isoformat()).execute()
+        for i in range(0, len(payload), 500):
+            supabase.table("stock_day_snapshot").insert(payload[i:i + 500]).execute()
+    except Exception:
+        # Snapshot is only analytical. Do not block main operation.
+        pass
+
+
+def page_database_connection_test(branch_code: str):
+    section_title("Database Connection Test", "Checks whether the required tables can be read.")
+    tables = [
+        "branches",
+        "ingredients",
+        "products",
+        "sub_recipes",
+        "recipe_ingredients",
+        "purchase_bill_header",
+        "purchase_bill_lines",
+        "stock_ledger",
+        "sales_upload_batches",
+        "sales_upload_lines",
+        "sales_recipe_consumption",
+        "prep_production_batches",
+        "prep_production_lines",
+        "stock_day_snapshot",
+    ]
+
+    rows = []
+    supabase = get_supabase_client()
+    for table in tables:
+        try:
+            result = supabase.table(table).select("*", count="exact").limit(1).execute()
+            rows.append({
+                "table": table,
+                "status": "OK",
+                "sample_rows_returned": len(result.data or []),
+                "error": "",
+            })
+        except Exception as e:
+            rows.append({
+                "table": table,
+                "status": "ERROR",
+                "sample_rows_returned": 0,
+                "error": str(e),
+            })
+
+    df = pd.DataFrame(rows)
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    st.write("### Branch current stock calculation test")
+    stock = get_current_stock(branch_code)
+    st.dataframe(stock.head(20), use_container_width=True, hide_index=True)
+
+
+def page_required_tables():
+    section_title("Required Table Summary", "Use the SQL file I provided to create these tables.")
+    data = [
+        ["branches", "Branch login and branch-wise stock filter"],
+        ["ingredients", "Purchased ingredients and produced/prep items together"],
+        ["products", "Final POS sale items"],
+        ["sub_recipes", "Prep/SOP header with output ingredient and Countable/Virtual prep type"],
+        ["recipe_ingredients", "One common product and sub-recipe detail table"],
+        ["purchase_bill_header / purchase_bill_lines", "Purchase entry"],
+        ["stock_ledger", "Single source of truth for stock"],
+        ["sales_upload_batches / sales_upload_lines", "Sales upload audit"],
+        ["sales_recipe_consumption", "Calculated consumption detail"],
+        ["prep_production_batches / prep_production_lines", "Auto prep production audit"],
+        ["stock_day_snapshot", "Daily Power BI / Excel reporting"],
+    ]
+    st.dataframe(pd.DataFrame(data, columns=["Table", "Purpose"]), use_container_width=True, hide_index=True)
+
+    st.info(
+        "Do not keep repeated header columns in Sub Recipe Detail. Keep those fields in sub_recipes, "
+        "and keep only component lines in recipe_ingredients."
+    )
+
+
+# ============================================================
 # Main app
-# -----------------------------
+# ============================================================
 def main():
     if not check_login():
         return
@@ -1239,10 +2029,13 @@ def main():
             "Opening / Stock Count",
             "Stock Adjustment",
             "Sales Report Upload",
+            "Finished Product Wastage",
+            "Auto Prep Production",
             "Current Stock",
             "Reports",
+            "Recipe Validation",
             "Database Connection Test",
-            "Required Extra Tables",
+            "Required Tables",
         ],
     )
 
@@ -1264,10 +2057,20 @@ def main():
         page_adjustment(branch_code)
     elif page == "Sales Report Upload":
         page_sales_upload(branch_code)
+    elif page == "Finished Product Wastage":
+        page_finished_product_wastage(branch_code)
+    elif page == "Auto Prep Production":
+        page_auto_prep_production(branch_code)
     elif page == "Current Stock":
         page_current_stock(branch_code)
     elif page == "Reports":
         page_reports(branch_code)
+    elif page == "Recipe Validation":
+        page_recipe_validation()
+    elif page == "Database Connection Test":
+        page_database_connection_test(branch_code)
+    elif page == "Required Tables":
+        page_required_tables()
 
 
 if __name__ == "__main__":
