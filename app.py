@@ -1251,7 +1251,14 @@ def page_sales_upload(branch_code: str):
     )
 
     sales_date = st.date_input("Sales Date", value=date.today())
-    uploaded_file = st.file_uploader("Upload Sales Report", type=["csv", "xlsx", "xls"])
+    if "sales_upload_uploader_version" not in st.session_state:
+        st.session_state.sales_upload_uploader_version = 0
+
+    uploaded_file = st.file_uploader(
+        "Upload Sales Report",
+        type=["csv", "xlsx", "xls"],
+        key=f"sales_upload_file_{st.session_state.sales_upload_uploader_version}",
+    )
     st.caption("Selected Sales Date must match the date inside the uploaded report.")
 
     if not uploaded_file:
@@ -1377,6 +1384,7 @@ def page_sales_upload(branch_code: str):
 
             save_stock_day_snapshot(branch_code, sales_date)
             st.success(f"Sales consumption posted. Batch ID: {batch_id}")
+            st.session_state.sales_upload_uploader_version += 1
             st.rerun()
 
         except Exception as e:
@@ -2065,12 +2073,6 @@ def main():
         page_current_stock(branch_code)
     elif page == "Reports":
         page_reports(branch_code)
-    elif page == "Recipe Validation":
-        page_recipe_validation()
-    elif page == "Database Connection Test":
-        page_database_connection_test(branch_code)
-    elif page == "Required Tables":
-        page_required_tables()
 
 
 if __name__ == "__main__":
