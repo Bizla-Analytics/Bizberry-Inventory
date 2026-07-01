@@ -1303,6 +1303,108 @@ create table if not exists stock_day_snapshot (
     )
 
 
+
+# -----------------------------
+# Database connection diagnostics
+# -----------------------------
+def page_database_connection_test(branch_code: str):
+    section_title(
+        "Database Connection Test",
+        "Use this page when Supabase tables exist but the app shows no data. It does not show your secret keys.",
+    )
+
+    url = str(st.secrets.get("SUPABASE_URL", "")).strip()
+    service_key = str(st.secrets.get("SUPABASE_SERVICE_ROLE_KEY", "")).strip()
+    anon_key = str(st.secrets.get("SUPABASE_ANON_KEY", "")).strip()
+
+    st.write("### Secrets check")
+    secrets_rows = [
+        {"Setting": "SUPABASE_URL", "Status": "Found" if url else "Missing", "Note": url[:35] + "..." if url else "Add this in Streamlit secrets"},
+        {"Setting": "SUPABASE_SERVICE_ROLE_KEY", "Status": "Found" if service_key else "Missing", "Note": "Recommended when RLS is enabled"},
+        {"Setting": "SUPABASE_ANON_KEY", "Status": "Found" if anon_key else "Missing", "Note": "Fallback only. Can show empty data when RLS blocks reads"},
+        {"Setting": "Logged-in branch_code", "Status": branch_code, "Note": "This must exactly match branches.branch_code"},
+    ]
+    st.dataframe(pd.DataFrame(secrets_rows), use_container_width=True, hide_index=True)
+
+    if not url or not (service_key or anon_key):
+        st.error("Supabase connection secrets are incomplete. Add SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY.")
+        return
+
+    if not service_key and anon_key:
+        st.warning(
+            "You are using SUPABASE_ANON_KEY fallback. If RLS is enabled, Supabase may return empty tables. "
+            "For this manager app, use SUPABASE_SERVICE_ROLE_KEY in Streamlit secrets."
+        )
+
+    st.write("### Table read test")
+    tests = [
+        ("branches", "branch_code, branch_name, active", None),
+        ("ingredients", "ingredient_code, ingredient_name, base_unit, active", None),
+        ("stock_ledger", "transaction_id, branch_code, ingredient_code, movement_type, qty_in, qty_out", branch_code),
+        ("purchase_bill_header", "bill_id, branch_code, bill_date, supplier_name, invoice_no", branch_code),
+    ]
+
+    results = []
+    previews = {}
+    supabase = get_supabase_client()
+
+    for table_name, cols, branch_filter in tests:
+        try:
+            q = supabase.table(table_name).select(cols)
+            if branch_filter and table_name != "ingredients":
+                q = q.eq("branch_code", branch_filter)
+            res = q.limit(5).execute()
+            df = supabase_result_to_df(res)
+            results.append({
+                "Table": table_name,
+                "Result": "Readable",
+                "Rows returned first 5": len(df),
+                "Meaning": "OK" if len(df) > 0 else "Readable but no rows returned",
+            })
+            previews[table_name] = df
+        except Exception as e:
+            results.append({
+                "Table": table_name,
+                "Result": "Error",
+                "Rows returned first 5": 0,
+                "Meaning": str(e),
+            })
+            previews[table_name] = pd.DataFrame()
+
+    st.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True)
+
+    st.write("### Preview returned rows")
+    for table_name, df in previews.items():
+        with st.expander(f"{table_name} preview", expanded=False):
+            if df.empty:
+                st.info("No rows returned for this test.")
+            else:
+                st.dataframe(df, use_container_width=True, hide_index=True)
+
+    st.write("### Most common causes")
+    st.markdown(
+        """
+1. **Wrong Streamlit project secrets**: the app is connected to another Supabase project URL.
+2. **Using anon key while RLS is enabled**: tables exist, but Supabase returns empty data.
+3. **Branch code mismatch**: secrets say `BR001`, but Supabase has `br001`, `BR-001`, or another code.
+4. **Data exists in Supabase dashboard but not in the selected project/environment**.
+5. **Service role key copied with extra spaces or wrong key**.
+        """
+    )
+
+    st.write("### Recommended Streamlit secrets")
+    st.code(
+        'SUPABASE_URL = "https://your-project-id.supabase.co"\n'
+        'SUPABASE_SERVICE_ROLE_KEY = "your-service-role-key"\n\n'
+        '[BRANCH_USERS.br001_manager]\n'
+        'password = "your-password"\n'
+        'branch_code = "BR001"\n'
+        'branch_name = "Pattambi"\n'
+        'display_name = "Pattambi Manager"',
+        language="toml",
+    )
+
+
 # -----------------------------
 # Main app
 # -----------------------------
@@ -1328,6 +1430,7 @@ def main():
             "Sales Report Upload",
             "Current Stock",
             "Reports",
+            "Database Connection Test",
             "Required Extra Tables",
         ],
     )
@@ -1354,6 +1457,8 @@ def main():
         page_current_stock(branch_code)
     elif page == "Reports":
         page_reports(branch_code)
+    elif page == "Database Connection Test":
+        page_database_connection_test(branch_code)
     elif page == "Required Extra Tables":
         page_schema_help()
 
