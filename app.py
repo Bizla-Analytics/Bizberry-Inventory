@@ -66,34 +66,74 @@ def load_branch_users() -> Dict[str, Dict[str, str]]:
     branch_code = "BR001"
     display_name = "Pattambi Manager"
 
-    [BRANCH_USERS.br002_manager]
-    password = "another-password"
-    branch_code = "BR002"
-    display_name = "Another Branch Manager"
+    Also supported as fallback:
 
-    Each login is mapped to exactly one branch.
-    There is no admin role inside this app.
+    [branch_users.br001_manager]
+    password = "manager-password"
+    branch_code = "BR001"
+
+    Or for one branch only:
+
+    MANAGER_USERNAME = "br001_manager"
+    MANAGER_PASSWORD = "manager-password"
+    MANAGER_BRANCH_CODE = "BR001"
+    MANAGER_DISPLAY_NAME = "Pattambi Manager"
     """
-    users_raw = st.secrets.get("BRANCH_USERS", {})
     users: Dict[str, Dict[str, str]] = {}
 
-    for username, config in users_raw.items():
-        try:
-            password = str(config.get("password", ""))
-            branch_code = str(config.get("branch_code", "")).strip().upper()
-            display_name = str(config.get("display_name", username)).strip()
-        except AttributeError:
-            continue
-
-        if username and password and branch_code:
-            users[str(username).strip()] = {
-                "password": password,
-                "branch_code": branch_code,
-                "display_name": display_name or str(username).strip(),
+    def add_user(username, password, branch_code, display_name=None):
+        username_clean = str(username or "").strip()
+        password_clean = str(password or "").strip()
+        branch_clean = str(branch_code or "").strip().upper()
+        display_clean = str(display_name or username_clean).strip()
+        if username_clean and password_clean and branch_clean:
+            users[username_clean.lower()] = {
+                "username": username_clean,
+                "password": password_clean,
+                "branch_code": branch_clean,
+                "display_name": display_clean or username_clean,
             }
+
+    for root_key in ["BRANCH_USERS", "branch_users"]:
+        users_raw = st.secrets.get(root_key, {})
+        if hasattr(users_raw, "items"):
+            for username, config in users_raw.items():
+                if hasattr(config, "get"):
+                    add_user(
+                        username=username,
+                        password=config.get("password") or config.get("PASSWORD"),
+                        branch_code=config.get("branch_code") or config.get("BRANCH_CODE"),
+                        display_name=config.get("display_name") or config.get("DISPLAY_NAME"),
+                    )
+
+    add_user(
+        username=st.secrets.get("MANAGER_USERNAME"),
+        password=st.secrets.get("MANAGER_PASSWORD"),
+        branch_code=st.secrets.get("MANAGER_BRANCH_CODE"),
+        display_name=st.secrets.get("MANAGER_DISPLAY_NAME"),
+    )
 
     return users
 
+
+def show_login_debug(users: Dict[str, Dict[str, str]]) -> None:
+    """Show safe login diagnostics without exposing passwords."""
+    with st.expander("Login setup check"):
+        if users:
+            safe_rows = [
+                {
+                    "username": u["username"],
+                    "branch_code": u["branch_code"],
+                    "display_name": u["display_name"],
+                    "password_saved": "Yes" if u.get("password") else "No",
+                }
+                for u in users.values()
+            ]
+            st.dataframe(pd.DataFrame(safe_rows), use_container_width=True, hide_index=True)
+            st.caption("Passwords are hidden. Username is not case-sensitive; password spaces are trimmed.")
+        else:
+            st.warning("No users were read from Streamlit secrets.")
+            st.code('SUPABASE_URL = "https://your-project-id.supabase.co"\\nSUPABASE_SERVICE_ROLE_KEY = "your-service-role-key"\\n\\n[BRANCH_USERS.br001_manager]\\npassword = "manager-password"\\nbranch_code = "BR001"\\ndisplay_name = "Pattambi Manager"', language="toml")
 
 def logout_user() -> None:
     for key in [
@@ -161,52 +201,54 @@ def check_login() -> bool:
     users = load_branch_users()
 
     if not users:
-        st.error(
-            "No branch users found in Streamlit secrets. Add [BRANCH_USERS.username] entries first."
-        )
-        with st.expander("Example Streamlit secrets format"):
-            st.code(
-                '''SUPABASE_URL = "https://your-project-id.supabase.co"
-SUPABASE_SERVICE_ROLE_KEY = "your-service-role-key"
-
-[BRANCH_USERS.br001_manager]
-password = "manager-password"
-branch_code = "BR001"
-display_name = "Pattambi Manager"''',
-                language="toml",
-            )
+        st.error("No branch users found in Streamlit secrets.")
+        show_login_debug(users)
         return False
 
-    username = st.text_input("Username").strip()
-    password = st.text_input("Password", type="password")
+    username_input = st.text_input("Username")
+    password_input = st.text_input("Password", type="password")
 
-    if st.button("Login", use_container_width=True):
-        user = users.get(username)
+    c1, c2 = st.columns([2, 1])
+    login_clicked = c1.button("Login", use_container_width=True)
+    debug_clicked = c2.button("Check Setup", use_container_width=True)
 
-        if not user or password != user["password"]:
-            st.error("Incorrect username or password.")
+    if debug_clicked:
+        show_login_debug(users)
+
+    if login_clicked:
+        username_key = str(username_input or "").strip().lower()
+        password_clean = str(password_input or "").strip()
+        user = users.get(username_key)
+
+        if not username_key:
+            st.error("Enter username.")
+            return False
+
+        if not password_clean:
+            st.error("Enter password.")
+            return False
+
+        if not user:
+            st.error("Username not found in Streamlit secrets.")
+            show_login_debug(users)
+            return False
+
+        if password_clean != user["password"]:
+            st.error("Password is not matching the password saved for this username.")
             return False
 
         branch_code = user["branch_code"]
         branch = get_branch_details(branch_code)
-
-        if not branch:
-            st.error(
-                f"Login is valid, but branch {branch_code} could not be read from Supabase. "
-                "Check the branch_code spelling in secrets, the branches table, and RLS/API key permissions. "
-                "If RLS is enabled, either add proper policies or use SUPABASE_SERVICE_ROLE_KEY in Streamlit secrets."
-            )
-            return False
+        branch_name = branch["branch_name"] if branch else branch_code
 
         st.session_state.authenticated = True
-        st.session_state.username = username
+        st.session_state.username = user["username"]
         st.session_state.manager_name = user["display_name"]
-        st.session_state.branch_code = branch["branch_code"]
-        st.session_state.branch_name = branch["branch_name"]
+        st.session_state.branch_code = branch_code
+        st.session_state.branch_name = branch_name
         st.rerun()
 
     return False
-
 
 def get_logged_in_branch_code() -> str:
     branch_code = st.session_state.get("branch_code")
@@ -1816,7 +1858,6 @@ def main():
             "Stock Adjustment",
             "Current Stock",
             "Reports",
-            "Master Data",
         ],
     )
 
@@ -1842,8 +1883,6 @@ def main():
         page_current_stock(branch_code)
     elif page == "Reports":
         page_reports(branch_code)
-    elif page == "Master Data":
-        page_master_data()
 
 
 if __name__ == "__main__":
