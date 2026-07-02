@@ -965,6 +965,380 @@ def post_ledger_for_consumption(
     insert_ledger_many(ledger_payload)
 
 
+
+# ============================================================
+# Morning count draft + auto close helpers
+# ============================================================
+def stock_count_draft_id(branch_code: str, count_date: date) -> str:
+    return f"{branch_code}-{count_date.isoformat()}"
+
+
+def get_or_create_stock_count_draft(branch_code: str, count_date: date) -> Dict[str, object]:
+    """One draft per branch per morning count date."""
+    supabase = get_supabase_client()
+    draft_id = stock_count_draft_id(branch_code, count_date)
+    result = (
+        supabase.table("stock_count_drafts")
+        .select("*")
+        .eq("draft_id", draft_id)
+        .limit(1)
+        .execute()
+    )
+    if result.data:
+        return result.data[0]
+
+    payload = {
+        "draft_id": draft_id,
+        "branch_code": branch_code,
+        "count_date": count_date.isoformat(),
+        "closing_for_date": (count_date - timedelta(days=1)).isoformat(),
+        "status": "DRAFT",
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+        "created_by": st.session_state.get("username"),
+        "posted_at": None,
+        "posted_by": None,
+        "posted_note": None,
+    }
+    supabase.table("stock_count_drafts").insert(payload).execute()
+    return payload
+
+
+def load_stock_count_draft_lines(draft_id: str) -> pd.DataFrame:
+    supabase = get_supabase_client()
+    try:
+        result = (
+            supabase.table("stock_count_draft_lines")
+            .select("*")
+            .eq("draft_id", draft_id)
+            .order("ingredient_name")
+            .execute()
+        )
+        return result_to_df(result)
+    except Exception as e:
+        st.warning(f"Could not read saved stock count draft lines: {e}")
+        return pd.DataFrame()
+
+
+def save_stock_count_draft_lines(draft_id: str, branch_code: str, count_date: date, edited: pd.DataFrame) -> None:
+    """Persist the manager's count work so refresh/network issues do not lose it."""
+    if edited.empty:
+        return
+
+    supabase = get_supabase_client()
+    now = datetime.now().isoformat(timespec="seconds")
+    payload = []
+    for _, row in edited.iterrows():
+        ing_code = str(row.get("ingredient_code") or "").strip().upper()
+        if not ing_code:
+            continue
+        payload.append({
+            "draft_id": draft_id,
+            "branch_code": branch_code,
+            "count_date": count_date.isoformat(),
+            "ingredient_code": ing_code,
+            "ingredient_name": str(row.get("ingredient_name") or ""),
+            "source_type": str(row.get("source_type") or ""),
+            "base_unit": str(row.get("base_unit") or ""),
+            "system_qty_at_load": as_float(row.get("current_qty")),
+            "physical_qty": as_float(row.get("physical_qty")),
+            "prep_wastage_qty": as_float(row.get("prep_wastage_qty")),
+            "reason": str(row.get("reason") or ""),
+            "updated_at": now,
+            "updated_by": st.session_state.get("username"),
+        })
+
+    if not payload:
+        return
+
+    # Requires unique index on (draft_id, ingredient_code), included in the SQL file.
+    supabase.table("stock_count_draft_lines").upsert(
+        payload,
+        on_conflict="draft_id,ingredient_code",
+    ).execute()
+
+    supabase.table("stock_count_drafts").update({
+        "updated_at": now,
+        "updated_by": st.session_state.get("username"),
+    }).eq("draft_id", draft_id).execute()
+
+
+def build_morning_count_table(branch_code: str, draft_id: str) -> pd.DataFrame:
+    stock = get_current_stock(branch_code)
+    if stock.empty:
+        return stock
+
+    count_df = stock[["ingredient_code", "ingredient_name", "source_type", "base_unit", "current_qty"]].copy()
+    count_df["physical_qty"] = count_df["current_qty"]
+    count_df["prep_wastage_qty"] = 0.0
+    count_df["reason"] = ""
+
+    saved = load_stock_count_draft_lines(draft_id)
+    if not saved.empty:
+        keep = ["ingredient_code", "physical_qty", "prep_wastage_qty", "reason"]
+        saved = saved[[c for c in keep if c in saved.columns]].copy()
+        saved["ingredient_code"] = saved["ingredient_code"].astype(str).str.strip().str.upper()
+        count_df = count_df.merge(saved, on="ingredient_code", how="left", suffixes=("", "_saved"))
+        for col in ["physical_qty", "prep_wastage_qty", "reason"]:
+            saved_col = f"{col}_saved"
+            if saved_col in count_df.columns:
+                count_df[col] = count_df[saved_col].where(count_df[saved_col].notna(), count_df[col])
+                count_df = count_df.drop(columns=[saved_col])
+
+    count_df["prep_wastage_qty"] = pd.to_numeric(count_df["prep_wastage_qty"], errors="coerce").fillna(0)
+    count_df["physical_qty"] = pd.to_numeric(count_df["physical_qty"], errors="coerce").fillna(0)
+    return count_df.sort_values(["source_type", "ingredient_name"])
+
+
+def countable_output_map() -> Dict[str, Dict[str, object]]:
+    countable = get_countable_prep_table()
+    if countable.empty:
+        return {}
+    out = {}
+    for _, row in countable.iterrows():
+        output_ing = str(row.get("output_ingredient_code") or "").strip().upper()
+        if output_ing:
+            out[output_ing] = {
+                "sub_recipe_code": str(row.get("sub_recipe_code") or "").strip().upper(),
+                "prep_item": row.get("ingredient_name") or row.get("sub_recipe_name") or output_ing,
+                "unit": row.get("base_unit") or row.get("output_unit") or "",
+            }
+    return out
+
+
+def ledger_exists_before(branch_code: str, before_dt: datetime) -> bool:
+    ledger = get_stock_ledger_raw(branch_code)
+    if ledger.empty:
+        return False
+    return not ledger[ledger["transaction_datetime"] < pd.Timestamp(before_dt)].empty
+
+
+def has_sales_upload_for_date(branch_code: str, target_date: date) -> bool:
+    ledger = get_day_ledger(branch_code, target_date)
+    if ledger.empty:
+        return False
+    return not ledger[ledger["movement_type"] == "Sales Recipe Consumption"].empty
+
+
+def draft_already_posted(draft: Dict[str, object]) -> bool:
+    return str(draft.get("status") or "").strip().upper() == "POSTED"
+
+
+def post_morning_stock_count_and_auto_prep(
+    branch_code: str,
+    count_date: date,
+    draft: Dict[str, object],
+    edited: pd.DataFrame,
+) -> Tuple[int, int, int, List[str]]:
+    """
+    Save one morning count.
+
+    - Purchased/Both items: post physical count differences.
+    - Countable produced prep items: calculate yesterday auto prep from morning count.
+    - If it is the first day/no prior ledger, treat count as initial stock and skip auto prep.
+    """
+    if draft_already_posted(draft):
+        return 0, 0, 0, ["This draft is already posted. No duplicate ledger entries were created."]
+
+    supabase = get_supabase_client()
+    draft_id = str(draft["draft_id"])
+    production_date = count_date - timedelta(days=1)
+    start_dt = datetime.combine(production_date, time(0, 0, 0))
+    end_dt = datetime.combine(count_date, time(0, 0, 0))
+
+    countable_map = countable_output_map()
+    recipe_df = get_recipe_ingredients()
+    sub_df = get_sub_recipes()
+
+    first_day_mode = not ledger_exists_before(branch_code, end_dt)
+    has_yesterday_sales = has_sales_upload_for_date(branch_code, production_date)
+
+    adjustment_count = 0
+    prep_batch_count = 0
+    prep_line_count = 0
+    warnings: List[str] = []
+
+    # First day / new branch: count becomes opening stock, no auto prep because there is no previous day POS/SOP base.
+    if first_day_mode:
+        tx_dt = datetime.combine(count_date, time(7, 0, 0))
+        ledger_payload = []
+        for _, row in edited.iterrows():
+            physical_qty = as_float(row.get("physical_qty"))
+            if physical_qty <= 0:
+                continue
+            ledger_payload.append({
+                "transaction_datetime": tx_dt.isoformat(timespec="seconds"),
+                "branch_code": branch_code,
+                "ingredient_code": str(row["ingredient_code"]).strip().upper(),
+                "movement_type": "Initial Stock Count",
+                "qty_in": physical_qty,
+                "qty_out": 0,
+                "reference_type": "Morning Stock Count Draft",
+                "reference_id": draft_id,
+                "note": row.get("reason") or "Initial stock loaded from morning count",
+            })
+        insert_ledger_many(ledger_payload)
+        adjustment_count = len(ledger_payload)
+        warnings.append("First stock count detected, so auto prep was skipped and physical quantities were loaded as initial stock.")
+    else:
+        # Normal mode: close yesterday using today's morning physical count.
+        for _, row in edited.iterrows():
+            ing_code = str(row.get("ingredient_code") or "").strip().upper()
+            physical_qty = as_float(row.get("physical_qty"))
+            prep_wastage_qty = as_float(row.get("prep_wastage_qty"))
+            reason = str(row.get("reason") or "").strip()
+            system_end_qty = get_stock_as_of(branch_code, ing_code, end_dt)
+            diff = round(physical_qty - system_end_qty, 6)
+
+            # Countable prep items are handled by auto prep, not direct physical adjustment, when possible.
+            if ing_code in countable_map:
+                prep_info = countable_map[ing_code]
+                sub_code = str(prep_info["sub_recipe_code"])
+                opening_qty = get_stock_as_of(branch_code, ing_code, start_dt)
+                day_ledger = get_day_ledger(branch_code, production_date)
+
+                if day_ledger.empty:
+                    sales_usage = 0.0
+                    ledger_wastage = 0.0
+                else:
+                    same_ing = day_ledger[day_ledger["ingredient_code"] == ing_code]
+                    sales_usage = float(same_ing[same_ing["movement_type"] == "Sales Recipe Consumption"]["qty_out"].sum())
+                    ledger_wastage = float(same_ing[same_ing["movement_type"].isin(["Prep Item Wastage"])]["qty_out"].sum())
+
+                total_wastage = ledger_wastage + prep_wastage_qty
+                prepared_qty = round(physical_qty + sales_usage + total_wastage - opening_qty, 6)
+
+                # If manager enters wastage in the morning count, post it as yesterday prep wastage.
+                if prep_wastage_qty > 0:
+                    add_stock_ledger(
+                        branch_code=branch_code,
+                        ingredient_code=ing_code,
+                        movement_type="Prep Item Wastage",
+                        qty_in=0,
+                        qty_out=prep_wastage_qty,
+                        reference_type="Morning Stock Count Draft",
+                        reference_id=draft_id,
+                        note=reason or "Prep wastage entered during morning count",
+                        transaction_datetime=datetime.combine(production_date, time(23, 57, 0)),
+                    )
+                    adjustment_count += 1
+
+                if prepared_qty > 0 and has_yesterday_sales:
+                    try:
+                        batch_result = supabase.table("prep_production_batches").insert({
+                            "branch_code": branch_code,
+                            "production_date": production_date.isoformat(),
+                            "sub_recipe_code": sub_code,
+                            "output_ingredient_code": ing_code,
+                            "prepared_qty": prepared_qty,
+                            "output_unit": str(prep_info.get("unit") or row.get("base_unit") or ""),
+                            "calculation_type": "Auto From Morning Count",
+                            "opening_qty": opening_qty,
+                            "sales_usage_qty": sales_usage,
+                            "wastage_qty": total_wastage,
+                            "closing_physical_qty": physical_qty,
+                            "note": reason,
+                            "created_at": datetime.now().isoformat(timespec="seconds"),
+                            "created_by": st.session_state.get("username"),
+                        }).execute()
+
+                        prep_batch_id = batch_result.data[0]["prep_batch_id"]
+                        tx_dt = datetime.combine(production_date, time(23, 58, 0))
+
+                        add_stock_ledger(
+                            branch_code=branch_code,
+                            ingredient_code=ing_code,
+                            movement_type="Prep Production Output",
+                            qty_in=prepared_qty,
+                            qty_out=0,
+                            reference_type="Morning Stock Count Draft",
+                            reference_id=str(prep_batch_id),
+                            note=f"{sub_code} auto production from morning count. Draft {draft_id}. {reason}",
+                            transaction_datetime=tx_dt,
+                        )
+
+                        raw_df = calculate_sub_recipe_raw_consumption(sub_code, prepared_qty, recipe_df, sub_df)
+                        line_payload = []
+                        ledger_payload = []
+                        for _, raw in raw_df.iterrows():
+                            component_ing = str(raw["ingredient_code"]).strip().upper()
+                            used_qty = as_float(raw["used_qty"])
+                            if used_qty <= 0:
+                                continue
+                            line_payload.append({
+                                "prep_batch_id": prep_batch_id,
+                                "component_ingredient_code": component_ing,
+                                "used_qty": used_qty,
+                                "unit": None,
+                                "note": f"Raw consumption for {sub_code} from morning count draft {draft_id}",
+                            })
+                            ledger_payload.append({
+                                "transaction_datetime": tx_dt.isoformat(timespec="seconds"),
+                                "branch_code": branch_code,
+                                "ingredient_code": component_ing,
+                                "movement_type": "Prep Production Consumption",
+                                "qty_in": 0,
+                                "qty_out": used_qty,
+                                "reference_type": "Morning Stock Count Draft",
+                                "reference_id": str(prep_batch_id),
+                                "note": f"Raw material used to produce {sub_code} from morning count draft {draft_id}",
+                            })
+
+                        if line_payload:
+                            supabase.table("prep_production_lines").insert(line_payload).execute()
+                        insert_ledger_many(ledger_payload)
+                        prep_batch_count += 1
+                        prep_line_count += len(line_payload)
+                    except Exception as e:
+                        warnings.append(f"Auto prep failed for {ing_code} / {sub_code}: {e}")
+                else:
+                    # No positive production. Correct the remaining physical difference if any.
+                    # This handles shortage/missing countable prep without falsely creating production.
+                    if abs(diff) > 0.000001:
+                        add_stock_ledger(
+                            branch_code=branch_code,
+                            ingredient_code=ing_code,
+                            movement_type="Physical Count Adjustment In" if diff > 0 else "Physical Count Adjustment Out",
+                            qty_in=diff if diff > 0 else 0,
+                            qty_out=abs(diff) if diff < 0 else 0,
+                            reference_type="Morning Stock Count Draft",
+                            reference_id=draft_id,
+                            note=reason or "Morning physical count difference for countable prep",
+                            transaction_datetime=datetime.combine(production_date, time(23, 59, 30)),
+                        )
+                        adjustment_count += 1
+                    if prepared_qty > 0 and not has_yesterday_sales:
+                        warnings.append(f"{ing_code}: positive prep was detected but yesterday POS sales are not uploaded, so auto prep was not posted.")
+                continue
+
+            # Purchased / non-countable items: normal physical count difference.
+            if abs(diff) > 0.000001:
+                add_stock_ledger(
+                    branch_code=branch_code,
+                    ingredient_code=ing_code,
+                    movement_type="Physical Count Adjustment In" if diff > 0 else "Physical Count Adjustment Out",
+                    qty_in=diff if diff > 0 else 0,
+                    qty_out=abs(diff) if diff < 0 else 0,
+                    reference_type="Morning Stock Count Draft",
+                    reference_id=draft_id,
+                    note=reason or "Morning physical count difference",
+                    transaction_datetime=datetime.combine(production_date, time(23, 59, 30)),
+                )
+                adjustment_count += 1
+
+    save_stock_day_snapshot(branch_code, count_date - timedelta(days=1))
+    save_stock_day_snapshot(branch_code, count_date)
+
+    supabase.table("stock_count_drafts").update({
+        "status": "POSTED",
+        "posted_at": datetime.now().isoformat(timespec="seconds"),
+        "posted_by": st.session_state.get("username"),
+        "posted_note": f"Adjustments: {adjustment_count}, prep batches: {prep_batch_count}, prep lines: {prep_line_count}",
+    }).eq("draft_id", draft_id).execute()
+
+    clear_data_cache()
+    return adjustment_count, prep_batch_count, prep_line_count, warnings
+
 # ============================================================
 # Pages
 # ============================================================
@@ -1129,11 +1503,26 @@ def page_add_purchase(branch_code: str):
 
 def page_stock_count(branch_code: str):
     section_title(
-        "Opening / Physical Stock Count",
-        "Records only the difference between system stock and physical stock. Negative stock is allowed before count correction.",
+        "Morning Stock Count / Close Yesterday",
+        "Enter today morning physical count. The same count closes yesterday and becomes today's opening stock. Countable prep items are auto-calculated here.",
     )
-    stock = get_current_stock(branch_code)
-    if stock.empty:
+
+    count_date = st.date_input("Morning Count Date", value=date.today())
+    production_date = count_date - timedelta(days=1)
+    st.caption(f"This count will close: {production_date.isoformat()} and become opening stock for: {count_date.isoformat()}.")
+
+    draft = get_or_create_stock_count_draft(branch_code, count_date)
+    draft_id = str(draft["draft_id"])
+
+    if draft_already_posted(draft):
+        st.success("This morning count draft is already posted to the stock ledger.")
+        posted = load_stock_count_draft_lines(draft_id)
+        if not posted.empty:
+            st.dataframe(posted, use_container_width=True, hide_index=True)
+        return
+
+    count_df = build_morning_count_table(branch_code, draft_id)
+    if count_df.empty:
         st.warning("No ingredients found.")
         return
 
@@ -1142,51 +1531,117 @@ def page_stock_count(branch_code: str):
         ["Purchased", "Produced", "Both"],
         default=["Purchased", "Produced", "Both"],
     )
-    stock = stock[stock["source_type"].isin(type_filter)].copy()
+    count_df = count_df[count_df["source_type"].isin(type_filter)].copy()
 
-    count_df = stock[["ingredient_code", "ingredient_name", "source_type", "base_unit", "current_qty"]].copy()
-    count_df["physical_qty"] = count_df["current_qty"]
-    count_df["reason"] = ""
+    st.info(
+        "Draft is saved to Supabase whenever this page reruns. If the browser refreshes or network drops, reopen the same date and continue."
+    )
 
     edited = st.data_editor(
         count_df,
         use_container_width=True,
         hide_index=True,
+        key=f"morning_stock_count_editor_{draft_id}",
         column_config={
             "ingredient_code": st.column_config.TextColumn("Code", disabled=True),
             "ingredient_name": st.column_config.TextColumn("Ingredient", disabled=True),
             "source_type": st.column_config.TextColumn("Type", disabled=True),
             "base_unit": st.column_config.TextColumn("Unit", disabled=True),
-            "current_qty": st.column_config.NumberColumn("System Stock", disabled=True),
-            "physical_qty": st.column_config.NumberColumn("Physical Count", step=1.0),
+            "current_qty": st.column_config.NumberColumn("System Stock Now", disabled=True),
+            "physical_qty": st.column_config.NumberColumn("Morning Physical Count", step=1.0),
+            "prep_wastage_qty": st.column_config.NumberColumn(
+                "Prep Wastage Qty",
+                step=1.0,
+                help="Use mainly for countable prep items when manager knows yesterday prep was wasted/spoiled.",
+            ),
             "reason": st.column_config.TextColumn("Reason / Note"),
         },
     )
 
-    if st.button("Save Stock Count Differences", use_container_width=True):
-        changes = 0
+    # Persist draft on every normal Streamlit rerun after editor returns.
+    try:
+        save_stock_count_draft_lines(draft_id, branch_code, count_date, edited)
+        st.caption(f"Draft saved: {datetime.now().strftime('%d/%m/%Y %I:%M:%S %p')}")
+    except Exception as e:
+        st.warning(f"Draft autosave failed: {e}")
+
+    countable_map = countable_output_map()
+    preview_rows = []
+    start_dt = datetime.combine(production_date, time(0, 0, 0))
+    end_dt = datetime.combine(count_date, time(0, 0, 0))
+    day_ledger = get_day_ledger(branch_code, production_date)
+
+    for _, row in edited.iterrows():
+        ing_code = str(row.get("ingredient_code") or "").strip().upper()
+        physical_qty = as_float(row.get("physical_qty"))
+        current_qty = as_float(row.get("current_qty"))
+        system_end_qty = get_stock_as_of(branch_code, ing_code, end_dt)
+        prep_wastage_qty = as_float(row.get("prep_wastage_qty"))
+
+        preview = {
+            "ingredient_code": ing_code,
+            "ingredient_name": row.get("ingredient_name"),
+            "source_type": row.get("source_type"),
+            "system_stock_now": current_qty,
+            "morning_physical_qty": physical_qty,
+            "difference_if_adjusted": round(physical_qty - system_end_qty, 6),
+            "auto_prep_sub_recipe": "",
+            "sales_usage_yesterday": 0.0,
+            "prep_wastage_yesterday": prep_wastage_qty,
+            "calculated_prepared_qty": 0.0,
+            "posting_action": "Physical count difference",
+        }
+
+        if ing_code in countable_map:
+            sub_code = countable_map[ing_code]["sub_recipe_code"]
+            opening_qty = get_stock_as_of(branch_code, ing_code, start_dt)
+            if day_ledger.empty:
+                sales_usage = 0.0
+                ledger_wastage = 0.0
+            else:
+                same_ing = day_ledger[day_ledger["ingredient_code"] == ing_code]
+                sales_usage = float(same_ing[same_ing["movement_type"] == "Sales Recipe Consumption"]["qty_out"].sum())
+                ledger_wastage = float(same_ing[same_ing["movement_type"].isin(["Prep Item Wastage"])]["qty_out"].sum())
+            prepared_qty = round(physical_qty + sales_usage + ledger_wastage + prep_wastage_qty - opening_qty, 6)
+            preview.update({
+                "auto_prep_sub_recipe": sub_code,
+                "sales_usage_yesterday": sales_usage,
+                "prep_wastage_yesterday": ledger_wastage + prep_wastage_qty,
+                "calculated_prepared_qty": prepared_qty,
+                "posting_action": "Auto prep production" if prepared_qty > 0 else "Physical count difference only",
+            })
+        preview_rows.append(preview)
+
+    st.write("### Posting Preview")
+    preview_df = pd.DataFrame(preview_rows)
+    st.dataframe(preview_df, use_container_width=True, hide_index=True)
+
+    c1, c2 = st.columns(2)
+    if c1.button("Save Draft Now", use_container_width=True):
         try:
-            for _, row in edited.iterrows():
-                system_qty = as_float(row["current_qty"])
-                physical_qty = as_float(row["physical_qty"])
-                diff = round(physical_qty - system_qty, 6)
-                if abs(diff) > 0.000001:
-                    add_stock_ledger(
-                        branch_code=branch_code,
-                        ingredient_code=row["ingredient_code"],
-                        movement_type="Physical Count Adjustment In" if diff > 0 else "Physical Count Adjustment Out",
-                        qty_in=diff if diff > 0 else 0,
-                        qty_out=abs(diff) if diff < 0 else 0,
-                        reference_type="Stock Count",
-                        reference_id=date.today().isoformat(),
-                        note=row.get("reason") or "Physical count difference",
-                    )
-                    changes += 1
-            st.success(f"Saved {changes} stock count difference(s).")
+            save_stock_count_draft_lines(draft_id, branch_code, count_date, edited)
+            st.success("Draft saved.")
             st.rerun()
         except Exception as e:
-            st.error(f"Could not save stock count differences. Error: {e}")
+            st.error(f"Could not save draft. Error: {e}")
 
+    if c2.button("Post Morning Count & Auto Prep", use_container_width=True, type="primary"):
+        try:
+            save_stock_count_draft_lines(draft_id, branch_code, count_date, edited)
+            adjustments, prep_batches, prep_lines, warnings = post_morning_stock_count_and_auto_prep(
+                branch_code=branch_code,
+                count_date=count_date,
+                draft=draft,
+                edited=edited,
+            )
+            st.success(
+                f"Posted morning count. Adjustments: {adjustments}, auto prep batches: {prep_batches}, raw material lines: {prep_lines}."
+            )
+            for msg in warnings:
+                st.warning(msg)
+            st.rerun()
+        except Exception as e:
+            st.error(f"Could not post morning count. Error: {e}")
 
 def page_adjustment(branch_code: str):
     section_title("Stock Adjustment", "Use for ingredient wastage, prep wastage, correction, staff meal, transfer, or other movement.")
@@ -1490,198 +1945,6 @@ def get_countable_prep_table() -> pd.DataFrame:
     return countable
 
 
-def page_auto_prep_production(branch_code: str):
-    section_title(
-        "Auto Prep Production From Count",
-        "Calculates prepared qty = closing physical + sales usage + prep wastage - opening stock, then deducts raw materials from SOP.",
-    )
-
-    production_date = st.date_input("Production Date", value=date.today() - timedelta(days=1))
-    countable = get_countable_prep_table()
-    recipe_df = get_recipe_ingredients()
-    sub_df = get_sub_recipes()
-
-    if countable.empty:
-        st.warning("No countable prep items found. Add sub_recipes with prep_type='Countable'.")
-        return
-
-    day_ledger = get_day_ledger(branch_code, production_date)
-    rows = []
-
-    start_dt = datetime.combine(production_date, time(0, 0, 0))
-    end_dt = datetime.combine(production_date + timedelta(days=1), time(0, 0, 0))
-
-    for _, prep in countable.iterrows():
-        output_ing = str(prep["output_ingredient_code"]).strip().upper()
-        opening_qty = get_stock_as_of(branch_code, output_ing, start_dt)
-        current_end_before_next_day = get_stock_as_of(branch_code, output_ing, end_dt)
-
-        if day_ledger.empty:
-            sales_usage = 0.0
-            wastage_qty = 0.0
-        else:
-            same_ing = day_ledger[day_ledger["ingredient_code"] == output_ing]
-            sales_usage = float(same_ing[same_ing["movement_type"] == "Sales Recipe Consumption"]["qty_out"].sum())
-            wastage_qty = float(same_ing[same_ing["movement_type"].isin(["Prep Item Wastage"])]["qty_out"].sum())
-
-        rows.append({
-            "Sub Recipe Code": prep["sub_recipe_code"],
-            "Prep Item": prep.get("ingredient_name") or prep.get("sub_recipe_name"),
-            "Output Ingredient Code": output_ing,
-            "Unit": prep.get("base_unit") or prep.get("output_unit"),
-            "Opening Qty": opening_qty,
-            "Sales Usage Qty": sales_usage,
-            "Prep Wastage Qty": wastage_qty,
-            "System End Qty": current_end_before_next_day,
-            "Closing Physical Qty": current_end_before_next_day,
-            "Note": "",
-        })
-
-    calc_df = pd.DataFrame(rows)
-
-    edited = st.data_editor(
-        calc_df,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "Sub Recipe Code": st.column_config.TextColumn(disabled=True),
-            "Prep Item": st.column_config.TextColumn(disabled=True),
-            "Output Ingredient Code": st.column_config.TextColumn(disabled=True),
-            "Unit": st.column_config.TextColumn(disabled=True),
-            "Opening Qty": st.column_config.NumberColumn(disabled=True),
-            "Sales Usage Qty": st.column_config.NumberColumn(disabled=True),
-            "Prep Wastage Qty": st.column_config.NumberColumn(disabled=True),
-            "System End Qty": st.column_config.NumberColumn(disabled=True),
-            "Closing Physical Qty": st.column_config.NumberColumn(step=1.0),
-            "Note": st.column_config.TextColumn(),
-        },
-    )
-
-    edited["Prepared Qty"] = (
-        pd.to_numeric(edited["Closing Physical Qty"], errors="coerce").fillna(0)
-        + pd.to_numeric(edited["Sales Usage Qty"], errors="coerce").fillna(0)
-        + pd.to_numeric(edited["Prep Wastage Qty"], errors="coerce").fillna(0)
-        - pd.to_numeric(edited["Opening Qty"], errors="coerce").fillna(0)
-    )
-    positive = edited[edited["Prepared Qty"] > 0].copy()
-
-    st.write("### Calculated prep production")
-    st.dataframe(edited, use_container_width=True, hide_index=True)
-
-    if positive.empty:
-        st.info("No positive prepared quantity calculated.")
-        return
-
-    st.write("### Raw material deduction preview")
-    preview_rows = []
-    error_messages = []
-    for _, r in positive.iterrows():
-        sub_code = str(r["Sub Recipe Code"]).strip().upper()
-        prepared_qty = as_float(r["Prepared Qty"])
-        try:
-            raw_df = calculate_sub_recipe_raw_consumption(sub_code, prepared_qty, recipe_df, sub_df)
-            for _, raw in raw_df.iterrows():
-                preview_rows.append({
-                    "Sub Recipe Code": sub_code,
-                    "Prep Item": r["Prep Item"],
-                    "Prepared Qty": prepared_qty,
-                    "Component Ingredient Code": raw["ingredient_code"],
-                    "Raw Used Qty": raw["used_qty"],
-                })
-        except Exception as e:
-            error_messages.append(f"{sub_code}: {e}")
-
-    if error_messages:
-        st.error("Some prep calculations failed:")
-        for msg in error_messages:
-            st.write("- " + msg)
-        return
-
-    preview = pd.DataFrame(preview_rows)
-    preview = enrich_ingredients(preview, code_col="Component Ingredient Code")
-    st.dataframe(preview, use_container_width=True, hide_index=True)
-
-    if st.button("Post Auto Prep Production", use_container_width=True):
-        try:
-            supabase = get_supabase_client()
-            for _, r in positive.iterrows():
-                sub_code = str(r["Sub Recipe Code"]).strip().upper()
-                output_ing = str(r["Output Ingredient Code"]).strip().upper()
-                prepared_qty = as_float(r["Prepared Qty"])
-                output_unit = str(r.get("Unit") or "")
-                note = str(r.get("Note") or "")
-
-                batch_result = supabase.table("prep_production_batches").insert({
-                    "branch_code": branch_code,
-                    "production_date": production_date.isoformat(),
-                    "sub_recipe_code": sub_code,
-                    "output_ingredient_code": output_ing,
-                    "prepared_qty": prepared_qty,
-                    "output_unit": output_unit,
-                    "calculation_type": "Auto From Count",
-                    "opening_qty": as_float(r["Opening Qty"]),
-                    "sales_usage_qty": as_float(r["Sales Usage Qty"]),
-                    "wastage_qty": as_float(r["Prep Wastage Qty"]),
-                    "closing_physical_qty": as_float(r["Closing Physical Qty"]),
-                    "note": note,
-                    "created_at": datetime.now().isoformat(timespec="seconds"),
-                    "created_by": st.session_state.get("username"),
-                }).execute()
-
-                prep_batch_id = batch_result.data[0]["prep_batch_id"]
-                tx_dt = datetime.combine(production_date, time(23, 58, 0))
-
-                # Output stock in
-                add_stock_ledger(
-                    branch_code=branch_code,
-                    ingredient_code=output_ing,
-                    movement_type="Prep Production Output",
-                    qty_in=prepared_qty,
-                    qty_out=0,
-                    reference_type="Auto Prep Production",
-                    reference_id=str(prep_batch_id),
-                    note=f"{sub_code} auto production. {note}",
-                    transaction_datetime=tx_dt,
-                )
-
-                # Raw/input stock out
-                raw_df = calculate_sub_recipe_raw_consumption(sub_code, prepared_qty, recipe_df, sub_df)
-                line_payload = []
-                ledger_payload = []
-                for _, raw in raw_df.iterrows():
-                    component_ing = str(raw["ingredient_code"]).strip().upper()
-                    used_qty = as_float(raw["used_qty"])
-                    line_payload.append({
-                        "prep_batch_id": prep_batch_id,
-                        "component_ingredient_code": component_ing,
-                        "used_qty": used_qty,
-                        "unit": None,
-                        "note": f"Raw consumption for {sub_code}",
-                    })
-                    ledger_payload.append({
-                        "transaction_datetime": tx_dt.isoformat(timespec="seconds"),
-                        "branch_code": branch_code,
-                        "ingredient_code": component_ing,
-                        "movement_type": "Prep Production Consumption",
-                        "qty_in": 0,
-                        "qty_out": used_qty,
-                        "reference_type": "Auto Prep Production",
-                        "reference_id": str(prep_batch_id),
-                        "note": f"Raw material used to produce {sub_code}",
-                    })
-
-                if line_payload:
-                    supabase.table("prep_production_lines").insert(line_payload).execute()
-                insert_ledger_many(ledger_payload)
-
-            save_stock_day_snapshot(branch_code, production_date)
-            st.success("Auto prep production posted.")
-            st.rerun()
-
-        except Exception as e:
-            st.error(f"Could not post auto prep production. Error: {e}")
-
-
 def page_current_stock(branch_code: str):
     section_title("Current Stock", "Calculated from stock_ledger, not manually stored.")
     stock = get_current_stock(branch_code)
@@ -1962,6 +2225,8 @@ def page_database_connection_test(branch_code: str):
         "prep_production_batches",
         "prep_production_lines",
         "stock_day_snapshot",
+        "stock_count_drafts",
+        "stock_count_draft_lines",
     ]
 
     rows = []
@@ -1991,27 +2256,6 @@ def page_database_connection_test(branch_code: str):
     st.dataframe(stock.head(20), use_container_width=True, hide_index=True)
 
 
-def page_required_tables():
-    section_title("Required Table Summary", "Use the SQL file I provided to create these tables.")
-    data = [
-        ["branches", "Branch login and branch-wise stock filter"],
-        ["ingredients", "Purchased ingredients and produced/prep items together"],
-        ["products", "Final POS sale items"],
-        ["sub_recipes", "Prep/SOP header with output ingredient and Countable/Virtual prep type"],
-        ["recipe_ingredients", "One common product and sub-recipe detail table"],
-        ["purchase_bill_header / purchase_bill_lines", "Purchase entry"],
-        ["stock_ledger", "Single source of truth for stock"],
-        ["sales_upload_batches / sales_upload_lines", "Sales upload audit"],
-        ["sales_recipe_consumption", "Calculated consumption detail"],
-        ["prep_production_batches / prep_production_lines", "Auto prep production audit"],
-        ["stock_day_snapshot", "Daily Power BI / Excel reporting"],
-    ]
-    st.dataframe(pd.DataFrame(data, columns=["Table", "Purpose"]), use_container_width=True, hide_index=True)
-
-    st.info(
-        "Do not keep repeated header columns in Sub Recipe Detail. Keep those fields in sub_recipes, "
-        "and keep only component lines in recipe_ingredients."
-    )
 
 
 # ============================================================
@@ -2034,16 +2278,14 @@ def main():
         [
             "Dashboard",
             "Add Purchase Bill",
-            "Opening / Stock Count",
+            "Morning Stock Count / Close Yesterday",
             "Stock Adjustment",
             "Sales Report Upload",
             "Finished Product Wastage",
-            "Auto Prep Production",
             "Current Stock",
             "Reports",
             "Recipe Validation",
             "Database Connection Test",
-            "Required Tables",
         ],
     )
 
@@ -2059,7 +2301,7 @@ def main():
         page_dashboard(branch_code)
     elif page == "Add Purchase Bill":
         page_add_purchase(branch_code)
-    elif page == "Opening / Stock Count":
+    elif page == "Morning Stock Count / Close Yesterday":
         page_stock_count(branch_code)
     elif page == "Stock Adjustment":
         page_adjustment(branch_code)
@@ -2067,12 +2309,14 @@ def main():
         page_sales_upload(branch_code)
     elif page == "Finished Product Wastage":
         page_finished_product_wastage(branch_code)
-    elif page == "Auto Prep Production":
-        page_auto_prep_production(branch_code)
     elif page == "Current Stock":
         page_current_stock(branch_code)
     elif page == "Reports":
         page_reports(branch_code)
+    elif page == "Recipe Validation":
+        page_recipe_validation()
+    elif page == "Database Connection Test":
+        page_database_connection_test(branch_code)
 
 
 if __name__ == "__main__":
