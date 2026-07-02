@@ -392,7 +392,13 @@ def get_stock_ledger_raw(branch_code: str, limit: Optional[int] = None) -> pd.Da
         return df
 
     df["ingredient_code"] = df["ingredient_code"].astype(str).str.strip().str.upper()
-    df["transaction_datetime"] = pd.to_datetime(df["transaction_datetime"], errors="coerce")
+    # Supabase may return timestamptz values as timezone-aware UTC.
+    # Convert to local naive datetime so comparisons with datetime.combine(date, time) do not fail.
+    df["transaction_datetime"] = (
+        pd.to_datetime(df["transaction_datetime"], errors="coerce", utc=True)
+        .dt.tz_convert("Asia/Kolkata")
+        .dt.tz_localize(None)
+    )
     for col in ["qty_in", "qty_out"]:
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
     return df
@@ -443,9 +449,22 @@ def get_stock_as_of(branch_code: str, ingredient_code: str, as_of_dt: datetime) 
     if ledger.empty:
         return 0.0
 
+    # Keep both sides timezone-naive in local app time.
+    # This prevents: TypeError: Invalid comparison between dtype=datetime64[ns, UTC] and Timestamp.
+    as_of_ts = pd.Timestamp(as_of_dt)
+    if as_of_ts.tzinfo is not None:
+        as_of_ts = as_of_ts.tz_convert("Asia/Kolkata").tz_localize(None)
+
+    tx = pd.to_datetime(ledger["transaction_datetime"], errors="coerce")
+    try:
+        if getattr(tx.dt, "tz", None) is not None:
+            tx = tx.dt.tz_convert("Asia/Kolkata").dt.tz_localize(None)
+    except Exception:
+        pass
+
     mask = (
         (ledger["ingredient_code"] == str(ingredient_code).strip().upper())
-        & (ledger["transaction_datetime"] < pd.Timestamp(as_of_dt))
+        & (tx < as_of_ts)
     )
     day = ledger[mask]
     if day.empty:
