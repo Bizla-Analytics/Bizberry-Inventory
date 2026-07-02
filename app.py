@@ -1523,12 +1523,14 @@ def page_add_purchase(branch_code: str):
 def page_stock_count(branch_code: str):
     section_title(
         "Morning Stock Count / Close Yesterday",
-        "Enter today morning physical count. The same count closes yesterday and becomes today's opening stock. Countable prep items are auto-calculated here.",
+        "Enter today morning physical count. This closes yesterday and becomes today's opening stock. Countable prep is calculated automatically on final post.",
     )
 
     count_date = st.date_input("Morning Count Date", value=date.today())
     production_date = count_date - timedelta(days=1)
-    st.caption(f"This count will close: {production_date.isoformat()} and become opening stock for: {count_date.isoformat()}.")
+    st.caption(
+        f"This count will close: {production_date.isoformat()} and become opening stock for: {count_date.isoformat()}."
+    )
 
     draft = get_or_create_stock_count_draft(branch_code, count_date)
     draft_id = str(draft["draft_id"])
@@ -1540,49 +1542,98 @@ def page_stock_count(branch_code: str):
             st.dataframe(posted, use_container_width=True, hide_index=True)
         return
 
-    count_df = build_morning_count_table(branch_code, draft_id)
-    if count_df.empty:
+    # ------------------------------------------------------------------
+    # IMPORTANT: Load from Supabase only once per browser session/date.
+    # Do not rebuild the editor from Supabase on every rerun, because it
+    # interrupts typing and moves the manager back to the top of the table.
+    # ------------------------------------------------------------------
+    editor_df_key = f"morning_count_df_{draft_id}"
+    editor_widget_key = f"morning_stock_count_editor_{draft_id}"
+    last_saved_key = f"morning_count_last_saved_{draft_id}"
+
+    if editor_df_key not in st.session_state:
+        st.session_state[editor_df_key] = build_morning_count_table(branch_code, draft_id)
+
+    if st.session_state[editor_df_key].empty:
         st.warning("No ingredients found.")
         return
 
-    type_filter = st.multiselect(
-        "Item Type",
-        ["Purchased", "Produced", "Both"],
-        default=["Purchased", "Produced", "Both"],
-    )
-    count_df = count_df[count_df["source_type"].isin(type_filter)].copy()
+    top1, top2 = st.columns([2, 1])
+    with top1:
+        type_filter = st.multiselect(
+            "Item Type",
+            ["Purchased", "Produced", "Both"],
+            default=["Purchased", "Produced", "Both"],
+            help="This only filters the visible rows. It does not delete hidden draft rows.",
+        )
+    with top2:
+        if st.button("Reload Saved Draft", use_container_width=True):
+            # User-controlled reload only. This may move the table, but it is intentional.
+            st.session_state[editor_df_key] = build_morning_count_table(branch_code, draft_id)
+            st.success("Saved draft reloaded from Supabase.")
+
+    full_df = st.session_state[editor_df_key].copy()
+    visible_mask = full_df["source_type"].isin(type_filter)
+    visible_df = full_df[visible_mask].copy()
 
     st.info(
-        "Draft is saved to Supabase whenever this page reruns. If the browser refreshes or network drops, reopen the same date and continue."
+        "The table is kept in browser session while editing. It will not save on every rerun. "
+        "Use Save Draft to store progress in Supabase, and Post Final only when the count is complete."
     )
 
-    edited = st.data_editor(
-        count_df,
-        use_container_width=True,
-        hide_index=True,
-        key=f"morning_stock_count_editor_{draft_id}",
-        column_config={
-            "ingredient_code": st.column_config.TextColumn("Code", disabled=True),
-            "ingredient_name": st.column_config.TextColumn("Ingredient", disabled=True),
-            "source_type": st.column_config.TextColumn("Type", disabled=True),
-            "base_unit": st.column_config.TextColumn("Unit", disabled=True),
-            "current_qty": st.column_config.NumberColumn("System Stock Now", disabled=True),
-            "physical_qty": st.column_config.NumberColumn("Morning Physical Count", step=1.0),
-            "prep_wastage_qty": st.column_config.NumberColumn(
-                "Prep Wastage Qty",
-                step=1.0,
-                help="Use mainly for countable prep items when manager knows yesterday prep was wasted/spoiled.",
-            ),
-            "reason": st.column_config.TextColumn("Reason / Note"),
-        },
-    )
+    with st.form(f"morning_count_form_{draft_id}", clear_on_submit=False):
+        edited_visible = st.data_editor(
+            visible_df,
+            use_container_width=True,
+            hide_index=True,
+            key=editor_widget_key,
+            column_config={
+                "ingredient_code": st.column_config.TextColumn("Code", disabled=True),
+                "ingredient_name": st.column_config.TextColumn("Ingredient", disabled=True),
+                "source_type": st.column_config.TextColumn("Type", disabled=True),
+                "base_unit": st.column_config.TextColumn("Unit", disabled=True),
+                "current_qty": st.column_config.NumberColumn("System Stock Now", disabled=True),
+                "physical_qty": st.column_config.NumberColumn("Morning Physical Count", step=1.0),
+                "prep_wastage_qty": st.column_config.NumberColumn(
+                    "Prep Wastage Qty",
+                    step=1.0,
+                    help="Use mainly for countable prep items when manager knows yesterday prep was wasted/spoiled.",
+                ),
+                "reason": st.column_config.TextColumn("Reason / Note"),
+            },
+        )
 
-    # Persist draft on every normal Streamlit rerun after editor returns.
-    try:
-        save_stock_count_draft_lines(draft_id, branch_code, count_date, edited)
-        st.caption(f"Draft saved: {datetime.now().strftime('%d/%m/%Y %I:%M:%S %p')}")
-    except Exception as e:
-        st.warning(f"Draft autosave failed: {e}")
+        c1, c2 = st.columns(2)
+        save_pressed = c1.form_submit_button("Save Draft", use_container_width=True)
+        post_pressed = c2.form_submit_button("Post Final Count & Auto Prep", use_container_width=True, type="primary")
+
+    # Merge only visible edited rows back into the full session dataframe.
+    # This keeps hidden rows safe when the manager uses the item type filter.
+    if not edited_visible.empty:
+        edited_visible = edited_visible.copy()
+        edited_visible["ingredient_code"] = edited_visible["ingredient_code"].astype(str).str.strip().str.upper()
+        full_df = full_df.copy()
+        full_df["ingredient_code"] = full_df["ingredient_code"].astype(str).str.strip().str.upper()
+        full_df = full_df.set_index("ingredient_code")
+        edited_visible = edited_visible.set_index("ingredient_code")
+        for col in edited_visible.columns:
+            if col in full_df.columns:
+                full_df.loc[edited_visible.index, col] = edited_visible[col]
+        full_df = full_df.reset_index()
+        st.session_state[editor_df_key] = full_df
+
+    edited = st.session_state[editor_df_key].copy()
+
+    if save_pressed:
+        try:
+            save_stock_count_draft_lines(draft_id, branch_code, count_date, edited)
+            st.session_state[last_saved_key] = datetime.now().strftime("%d/%m/%Y %I:%M:%S %p")
+            st.success("Draft saved to Supabase. You can close/reopen this page and continue from this saved point.")
+        except Exception as e:
+            st.error(f"Could not save draft. Error: {e}")
+
+    if st.session_state.get(last_saved_key):
+        st.caption(f"Last manually saved: {st.session_state[last_saved_key]}")
 
     countable_map = countable_output_map()
     preview_rows = []
@@ -1635,17 +1686,9 @@ def page_stock_count(branch_code: str):
     preview_df = pd.DataFrame(preview_rows)
     st.dataframe(preview_df, use_container_width=True, hide_index=True)
 
-    c1, c2 = st.columns(2)
-    if c1.button("Save Draft Now", use_container_width=True):
+    if post_pressed:
         try:
-            save_stock_count_draft_lines(draft_id, branch_code, count_date, edited)
-            st.success("Draft saved.")
-            st.rerun()
-        except Exception as e:
-            st.error(f"Could not save draft. Error: {e}")
-
-    if c2.button("Post Morning Count & Auto Prep", use_container_width=True, type="primary"):
-        try:
+            # Save the final edited version first, then post from the same session dataframe.
             save_stock_count_draft_lines(draft_id, branch_code, count_date, edited)
             adjustments, prep_batches, prep_lines, warnings = post_morning_stock_count_and_auto_prep(
                 branch_code=branch_code,
@@ -1653,6 +1696,9 @@ def page_stock_count(branch_code: str):
                 draft=draft,
                 edited=edited,
             )
+            # Clear only this editor from session after successful final post.
+            st.session_state.pop(editor_df_key, None)
+            st.session_state.pop(last_saved_key, None)
             st.success(
                 f"Posted morning count. Adjustments: {adjustments}, auto prep batches: {prep_batches}, raw material lines: {prep_lines}."
             )
